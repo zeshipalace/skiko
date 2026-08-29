@@ -499,6 +499,24 @@ if (supportAndroid) {
 
 skikoProjectContext.declarePublications()
 
+// Voxzen fork: 发布到 GitHub Packages,供 Windows 构建机等共享拉取。
+// configurePublishingRepositories 中的 configureEach 会自动注册 publishToVoxzenGitHubPackages 任务。
+// 凭据:gradle property gpr.user/gpr.key,或环境变量 GITHUB_ACTOR/GITHUB_TOKEN(CI)。
+publishing {
+    repositories {
+        maven {
+            name = "VoxzenGitHubPackages"
+            url = uri("https://maven.pkg.github.com/zeshipalace/skiko")
+            credentials {
+                username = providers.gradleProperty("gpr.user")
+                    .orElse(providers.environmentVariable("GITHUB_ACTOR")).orNull
+                password = providers.gradleProperty("gpr.key")
+                    .orElse(providers.environmentVariable("GITHUB_TOKEN")).orNull
+            }
+        }
+    }
+}
+
 val mavenCentral = MavenCentralProperties(project)
 if (skiko.isTeamcityCIBuild || mavenCentral.signArtifacts) {
     signing {
