@@ -30,17 +30,24 @@ master(0.152.x 线)与 CMP 1.12.0 **二进制不兼容**,实测:
 
 注意:不要省略 `-Pdeploy.release=true`(省略会追加 `-SNAPSHOT` 后缀,与 Voxzen 锁定的版本号对不上)。
 
-## 发布到 GitHub Packages(共享 / Windows 构建机拉取)
+## 发布到 GitHub Packages(共享 / CI 全平台)
 
 1. `skiko/gradle.properties` 中 `deploy.version` 尾号 +1(GPR 不允许覆盖同版本)
 2. 本机构建验证通过后提交并推送 `voxzen` 分支
-3. 发布 Linux 侧全部产物(本机或 CI 均可):
-   ```bash
-   ./gradlew -p skiko publishToVoxzenGitHubPackages -Pdeploy.release=true
-   ```
-   凭据:gradle property `gpr.user`/`gpr.key`,或环境变量 `GITHUB_ACTOR`/`GITHUB_TOKEN`
-4. Windows runtime:在 GitHub Actions 手动运行 `Voxzen Publish` workflow(`.github/workflows/publish-voxzen.yml`),windows 作业只发布 `skiko-awt-runtime-windows-x64`
-5. Voxzen 仓库 `gradle.properties` 更新 `voxzen.skiko.version` 为新版本号
+3. 在 GitHub Actions 手动运行 `Voxzen Publish` workflow(`.github/workflows/publish-voxzen.yml`),一次运行发布全部 6 个桌面 AWT 平台:
+   - `publish-linux`:docker `linux-compat` 镜像内发布全部公共产物(skiko、skiko-awt、skiko-awt-runtime 等)+ linux-x64 runtime(旧 glibc 基线,可对外分发)
+   - `publish-linux-arm64`:`ubuntu-24.04-arm` runner + `linux-compat` 镜像(**ARM runner 只对公开仓库免费**)
+   - `publish-windows`:windows-2022,x64 本机编译 + arm64 MSVC 交叉编译
+   - `publish-macos`:macos-15(arm64 本机 + x64 工具链交叉编译)
+   - 非 linux 作业只发平台独有 runtime,避免重复推送公共产物(GPR 拒收重复版本,会失败)
+   - 首次运行会先在 CI 本地构建 docker 镜像(ghcr 无 `linux-compat:voxzen` tag 时自动 build,较耗时);可提前跑 `Docker Publish` workflow 预热镜像
+4. Voxzen 仓库 `gradle.properties` 更新 `voxzen.skiko.version` 为新版本号
+
+也可以只发 Linux 侧(本机或 CI):
+```bash
+./gradlew -p skiko publishToVoxzenGitHubPackages -Pdeploy.release=true
+```
+凭据:gradle property `gpr.user`/`gpr.key`,或环境变量 `GITHUB_ACTOR`/`GITHUB_TOKEN`
 
 ## 上游同步(CMP 升级时)
 
@@ -52,7 +59,7 @@ master(0.152.x 线)与 CMP 1.12.0 **二进制不兼容**,实测:
 
 ## 已知限制
 
-- **本机编译的 linux runtime 链接本机 glibc**(Arch,较新):本地开发无问题;若对外分发 Linux 构建,需用仓库的 docker `linux-compat` 镜像构建(参考 `.github/workflows/publish-dry-run.yml`)
-- `skiko-awt-runtime-all`(全平台 uber jar)在本机/单作业发布时只含本机平台;Voxzen 不使用该产物(CMP 按平台引用 `skiko-awt-runtime-<os>-<arch>`),无需处理
-- 暂未构建 windows-arm64 / linux-arm64 / macOS runtime;需要时扩展 `publish-voxzen.yml` 矩阵
-  - 注意:fork 发布的 `skiko-awt` 模块元数据带有指向全部平台 runtime 的严格版本约束(继承上游按全平台发布的设计),未发布平台的模块在 fork 仓库不存在。消费方若解析全平台变体(如 compose-hot-reload 的 `syncDesktopMainStartupLibs` 会拉 salt-ui 传递的 macos-arm64)会解析失败;Voxzen 侧已在 `settings.gradle.kts` 用"未发布模块不改写版本 + `ComponentMetadataRule` 移除严格约束"处理
+- **本机编译的 linux runtime 链接本机 glibc**(Arch,较新):本地开发无问题;对外分发的 linux 产物由 `Voxzen Publish` workflow 在 docker `linux-compat` 镜像内构建(旧 glibc 基线),不要用本机 `publishToVoxzenGitHubPackages` 发布对外版本
+- `skiko-awt-runtime-all`(全平台 uber jar)在各作业独立发布时只含本机平台;Voxzen 不使用该产物(CMP 按平台引用 `skiko-awt-runtime-<os>-<arch>`),无需处理
+- Android / Web(wasm)产物未发布;Voxzen 只用桌面 AWT 平台,需要时参考 `publish-dry-run.yml` 的 Android/Web 作业扩展
+- fork 发布的 `skiko-awt` 模块元数据带有指向全部平台 runtime 的严格版本约束(继承上游设计)。自全平台 CI 发布起 6 个桌面 AWT runtime 均可满足;Voxzen `settings.gradle.kts` 中的"未发布模块排除 + `SkikoAwtUnpublishedRuntimeRule`"防御逻辑是为未全平台发布的旧版本(≤ voxzen.2)准备的,确认 GPR 上当前版本全平台齐全后可移除

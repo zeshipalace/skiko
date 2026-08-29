@@ -4,10 +4,17 @@ name: Voxzen Publish
 # 手动触发。发布前必须先递增 skiko/gradle.properties 中 deploy.version 的 -voxzen.N 尾号,
 # GitHub Packages 不允许覆盖已存在的版本。
 #
-# - linux 作业:发布全部 Linux 可建产物(skiko 主模块、skiko-awt、linux-x64 runtime 等)
-# - windows 作业:只发布 Windows 独有的 runtime,避免与 linux 作业重复推送 skiko-awt
+# 作业划分(与上游 publish-dry-run.yml 的平台构建方式一致):
+# - publish-linux:docker linux-compat 镜像内发布全部公共产物(skiko 主模块、skiko-awt、
+#   skiko-awt-runtime 等)与 linux-x64 runtime;linux-compat 提供旧 glibc 基线,产物可分发给老发行版
+# - publish-linux-arm64:ARM runner + docker linux-compat,只发 linux-arm64 runtime
+#   (上游注明 x64 交叉编译 arm64 不可用)
+# - publish-windows / publish-macos:各发自己平台的 x64 + arm64 runtime
 #
-# 两个作业完成后,Voxzen 侧更新 gradle.properties 的 voxzen.skiko.version 即可全平台使用。
+# 非 linux 作业只发布平台独有的 runtime 产物:公共产物由 publish-linux 发布,
+# GitHub Packages 拒收重复版本,重复推送会导致作业失败。
+#
+# 全部作业完成后,Voxzen 侧更新 gradle.properties 的 voxzen.skiko.version 即可全平台使用。
 
 on:
   workflow_dispatch:
@@ -18,33 +25,66 @@ permissions:
 
 jobs:
   publish-linux:
-    name: 'Publish (Linux)'
+    name: 'Publish (Linux x64 + shared artifacts)'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         name: 'Check out code'
-
-      - uses: actions/setup-java@v4
-        name: 'Setup JDK 21'
         with:
-          java-version: '21'
-          distribution: 'corretto'
+          # docker-skiko-run 的 paths-filter 需要 base ref(master)可比较
+          fetch-depth: 0
+
+      # workflow_dispatch 下 paths-filter 的 base 回退为 'master',checkout 只建远程跟踪分支,补一个本地 ref
+      - name: 'Ensure local master ref for paths-filter'
+        shell: bash
+        run: git rev-parse --verify master >/dev/null 2>&1 || git branch master origin/master
 
       - uses: ./.github/actions/setup-prerequisites
         name: 'Setup Prerequisites'
 
-      - shell: bash
-        name: 'Publish all Linux-built artifacts to GitHub Packages'
-        env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ./gradlew -p skiko --no-daemon --stacktrace \
-            -Pdeploy.release=true \
-            publishToVoxzenGitHubPackages
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish shared artifacts and Linux x64 runtime to GitHub Packages'
+        with:
+          image_name: linux-compat
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          command: |
+            ./gradlew -p skiko --no-daemon --stacktrace \
+              -Pdeploy.release=true \
+              -Pskiko.native.enabled=true \
+              -Pskiko.awt.enabled=true \
+              -Pskiko.arch=x64 \
+              publishToVoxzenGitHubPackages
 
-  publish-windows-runtime:
-    name: 'Publish Windows runtime'
+  publish-linux-arm64:
+    name: 'Publish Linux arm64 runtime'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+        with:
+          fetch-depth: 0
+
+      - name: 'Ensure local master ref for paths-filter'
+        shell: bash
+        run: git rev-parse --verify master >/dev/null 2>&1 || git branch master origin/master
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - uses: ./.github/actions/docker-skiko-run
+        name: 'Publish Linux arm64 runtime to GitHub Packages'
+        with:
+          image_name: linux-compat
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          command: |
+            ./gradlew -p skiko --no-daemon --stacktrace \
+              -Pdeploy.release=true \
+              -Pskiko.awt.enabled=true \
+              -Pskiko.arch=arm64 \
+              publishSkikoJvmRuntimeLinuxArm64PublicationToVoxzenGitHubPackagesRepository
+
+  publish-windows:
+    name: 'Publish Windows runtimes'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -63,9 +103,9 @@ jobs:
       - uses: ./.github/actions/setup-prerequisites
         name: 'Setup Prerequisites'
 
-      # 只发布 Windows 独有的 runtime;skiko-awt 等公共产物由 linux 作业发布
+      # 只发布 Windows 独有的 runtime;skiko-awt 等公共产物由 publish-linux 发布
       - shell: bash
-        name: 'Publish Windows runtime to GitHub Packages'
+        name: 'Publish Windows x64 runtime to GitHub Packages'
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -73,3 +113,58 @@ jobs:
           ./gradlew -p skiko --no-daemon --stacktrace \
             -Pdeploy.release=true \
             publishSkikoJvmRuntimeWindowsX64PublicationToVoxzenGitHubPackagesRepository
+
+      # arm64 需要单独的 gradle 调用(skiko.arch 是全局属性),MSVC 交叉编译
+      - shell: bash
+        name: 'Publish Windows arm64 runtime to GitHub Packages'
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=arm64 \
+            publishSkikoJvmRuntimeWindowsArm64PublicationToVoxzenGitHubPackagesRepository
+
+  publish-macos:
+    name: 'Publish macOS runtimes'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        name: 'Check out code'
+
+      - uses: actions/setup-java@v4
+        name: 'Setup JDK 21'
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - uses: ./.github/actions/setup-prerequisites
+        name: 'Setup Prerequisites'
+
+      - shell: bash
+        name: 'Publish macOS arm64 runtime to GitHub Packages'
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.native.enabled=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=arm64 \
+            publishSkikoJvmRuntimeMacosArm64PublicationToVoxzenGitHubPackagesRepository
+
+      # x64 交叉编译(macOS 工具链原生支持),单独的 gradle 调用
+      - shell: bash
+        name: 'Publish macOS x64 runtime to GitHub Packages'
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=x64 \
+            publishSkikoJvmRuntimeMacosX64PublicationToVoxzenGitHubPackagesRepository

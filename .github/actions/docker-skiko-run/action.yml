@@ -16,6 +16,10 @@ inputs:
     description: 'Enable virtual display for UI testing (enables e2e UI interaction tests with real windows)'
     required: false
     default: 'false'
+  github-token:
+    description: 'Voxzen fork: token exposed inside the container as GITHUB_TOKEN (with GITHUB_ACTOR), needed when the command publishes to GitHub Packages'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -86,8 +90,15 @@ runs:
 
     - name: 'Run command in container'
       shell: bash
+      env:
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
       run: |
+        DOCKER_ENV_ARGS=()
+        if [[ -n "$GITHUB_TOKEN_INPUT" ]]; then
+          DOCKER_ENV_ARGS=(-e "GITHUB_ACTOR=${GITHUB_ACTOR}" -e "GITHUB_TOKEN=${GITHUB_TOKEN_INPUT}")
+        fi
         docker run --rm \
+          "${DOCKER_ENV_ARGS[@]}" \
           -v "${{ github.workspace }}":/workspace \
           -v "${HOME}/.gradle":/gradle-cache \
           -v "${HOME}/.m2":/root/.m2 \
