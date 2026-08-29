@@ -11,6 +11,58 @@
 
 typedef GLXContext (*glXCreateContextAttribsARBProc)(Display *, GLXFBConfig, GLXContext, Bool, const int *);
 
+// Creates a GLX context bound to the window's actual visual.
+//
+// AWT picks a 32-bit ARGB visual for transparent windows, but a GLX context
+// created from a self-chosen (typically 24-bit) visual is still accepted by
+// glXMakeCurrent while rendering into the drawable with the wrong channel
+// layout. Compositors (KWin Wayland over XWayland) then read a zeroed alpha
+// channel and the window shows up fully transparent.
+static GLXContext createContextForWindowVisual(Display *display, Window window)
+{
+    XWindowAttributes attrs;
+    if (!XGetWindowAttributes(display, window, &attrs) || !attrs.visual || !attrs.screen)
+    {
+        return NULL;
+    }
+
+    VisualID visualId = XVisualIDFromVisual(attrs.visual);
+    int screen = XScreenNumberOfScreen(attrs.screen);
+
+    int numConfigs = 0;
+    GLXFBConfig *fbConfigs = glXGetFBConfigs(display, screen, &numConfigs);
+    if (!fbConfigs)
+    {
+        return NULL;
+    }
+
+    GLXFBConfig matched = NULL;
+    for (int i = 0; i < numConfigs; i++)
+    {
+        int configVisualId = 0;
+        if (glXGetFBConfigAttrib(display, fbConfigs[i], GLX_VISUAL_ID, &configVisualId) != Success ||
+            (VisualID)configVisualId != visualId)
+        {
+            continue;
+        }
+        int doubleBuffered = False;
+        glXGetFBConfigAttrib(display, fbConfigs[i], GLX_DOUBLEBUFFER, &doubleBuffered);
+        matched = fbConfigs[i];
+        if (doubleBuffered)
+        {
+            break;
+        }
+    }
+
+    GLXContext context = NULL;
+    if (matched)
+    {
+        context = glXCreateNewContext(display, matched, GLX_RGBA_TYPE, NULL, GL_TRUE);
+    }
+    XFree(fbConfigs);
+    return context;
+}
+
 extern "C"
 {
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_setSwapInterval(JNIEnv *env, jobject redrawer, jlong displayPtr, jlong windowPtr, jint interval)
@@ -63,11 +115,22 @@ extern "C"
         glXMakeCurrent(display, window, *context);
     }
 
-    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_createContext(JNIEnv *env, jobject redrawer, jlong displayPtr, jboolean transparency)
+    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_createContext(JNIEnv *env, jobject redrawer, jlong displayPtr, jlong windowPtr, jboolean transparency)
     {
         Display *display = fromJavaPointer<Display *>(displayPtr);
+        Window window = fromJavaPointer<Window>(windowPtr);
         if (!display) return 0;
 
+        if (window)
+        {
+            GLXContext visualContext = createContextForWindowVisual(display, window);
+            if (visualContext)
+            {
+                return toJavaPointer(new GLXContext(visualContext));
+            }
+        }
+
+        // Fallback: choose a visual ourselves (legacy path).
         XVisualInfo *vi;
 
         if (transparency)
@@ -89,8 +152,11 @@ extern "C"
 
         if (!vi) return 0;
 
-        GLXContext *context = new GLXContext(glXCreateContext(display, vi, NULL, GL_TRUE));
-        return toJavaPointer(context);
+        GLXContext context = glXCreateContext(display, vi, NULL, GL_TRUE);
+        XFree(vi);
+        if (!context) return 0;
+
+        return toJavaPointer(new GLXContext(context));
     }
 
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_destroyContext(JNIEnv *env, jobject redrawer, jlong displayPtr, jlong contextPtr)

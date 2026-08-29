@@ -165,14 +165,14 @@ internal class LinuxOpenGLRedrawer(
     }
 }
 
-private fun LinuxDrawingSurface.createContext(transparency: Boolean) = createContext(display, transparency)
+private fun LinuxDrawingSurface.createContext(transparency: Boolean) = createContext(display, window, transparency)
 private fun LinuxDrawingSurface.destroyContext(context: Long) = destroyContext(display, context)
 private fun LinuxDrawingSurface.makeCurrent(context: Long) = makeCurrent(display, window, context)
 private fun LinuxDrawingSurface.swapBuffers() = swapBuffers(display, window)
 private fun LinuxDrawingSurface.setSwapInterval(interval: Int) = setSwapInterval(display, window, interval)
 
 private external fun makeCurrent(display: Long, window: Long, context: Long)
-private external fun createContext(display: Long, transparency: Boolean): Long
+private external fun createContext(display: Long, window: Long, transparency: Boolean): Long
 private external fun destroyContext(display: Long, context: Long)
 private external fun setSwapInterval(display: Long, window: Long, interval: Int)
 private external fun swapBuffers(display: Long, window: Long)

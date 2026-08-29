@@ -8,6 +8,7 @@
 - 版本号:`skiko/gradle.properties` 的 `deploy.version`,规则 `0.150.1-voxzen.N`
 - 补丁栈(在基点之上):
   - cherry-pick 上游 PR [#1282](https://github.com/JetBrains/skiko/pull/1282)(SkiaSwingLayer frame pacing,`skiko.swing.frame.pacing`);`SkikoProperties.kt` 冲突已按本分支的非 lazy 属性风格移植
+  - Linux GLX 上下文按窗口实际 Visual 创建(voxzen.2):`redrawer.cc` 的 `createContext` 新增 window 参数,先 `XGetWindowAttributes` 取窗口 Visual,再在 `glXGetFBConfigs` 中按 `GLX_VISUAL_ID` 匹配 FBConfig 用 `glXCreateNewContext` 建上下文;失败回退原 `glXChooseVisual` 路径。修复 KDE Wayland(XWayland)下 OpenGL 透明窗口全透明(CMP-6639;`glXChooseVisual` 选到 24 位 Visual 而 AWT 透明窗口用 32 位 ARGB,`glXMakeCurrent` 不报错但 alpha 通道全 0)
 
 ### 为什么不基于 master
 
@@ -54,3 +55,4 @@ master(0.152.x 线)与 CMP 1.12.0 **二进制不兼容**,实测:
 - **本机编译的 linux runtime 链接本机 glibc**(Arch,较新):本地开发无问题;若对外分发 Linux 构建,需用仓库的 docker `linux-compat` 镜像构建(参考 `.github/workflows/publish-dry-run.yml`)
 - `skiko-awt-runtime-all`(全平台 uber jar)在本机/单作业发布时只含本机平台;Voxzen 不使用该产物(CMP 按平台引用 `skiko-awt-runtime-<os>-<arch>`),无需处理
 - 暂未构建 windows-arm64 / linux-arm64 / macOS runtime;需要时扩展 `publish-voxzen.yml` 矩阵
+  - 注意:fork 发布的 `skiko-awt` 模块元数据带有指向全部平台 runtime 的严格版本约束(继承上游按全平台发布的设计),未发布平台的模块在 fork 仓库不存在。消费方若解析全平台变体(如 compose-hot-reload 的 `syncDesktopMainStartupLibs` 会拉 salt-ui 传递的 macos-arm64)会解析失败;Voxzen 侧已在 `settings.gradle.kts` 用"未发布模块不改写版本 + `ComponentMetadataRule` 移除严格约束"处理
