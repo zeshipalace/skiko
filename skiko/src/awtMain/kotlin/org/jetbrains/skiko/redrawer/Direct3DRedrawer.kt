@@ -119,19 +119,13 @@ internal class Direct3DRedrawer(
         }
     }
 
-    private fun drawAndSwap(scope: LayerDrawScope, withVsync: Boolean, synchronizeLiveResize: Boolean = false) {
+    private fun drawAndSwap(scope: LayerDrawScope, withVsync: Boolean, waitForComposition: Boolean = false) {
         synchronized(drawLock) {
             if (isDisposed) {
                 return
             }
-
-            // A waitable swap chain signals just after DXGI finishes presenting the previous frame. Waiting here,
-            // before ResizeBuffers and drawing, leaves the rest of the composition interval for both Present and the
-            // pending Win32 geometry to reach DWM. The old DwmFlush ordering is retained only as a compatibility
-            // fallback when the platform cannot provide a waitable swap chain.
-            val hasLowLatencyPresentSlot = !synchronizeLiveResize || waitForPresentSlot(device)
             with(scope) { drawFrame() }
-            if (synchronizeLiveResize && !hasLowLatencyPresentSlot) {
+            if (waitForComposition) {
                 waitForComposition()
             }
             swap(withVsync)
@@ -303,7 +297,7 @@ internal class Direct3DRedrawer(
                     drawAndSwap(
                         scope,
                         withVsync = !isResizeFrame,
-                        synchronizeLiveResize = isResizeFrame
+                        waitForComposition = isResizeFrame
                     )
                 }
             }
@@ -326,7 +320,6 @@ internal class Direct3DRedrawer(
     private external fun installLiveResizeHook(window: Long, content: Long): Long
     private external fun uninstallLiveResizeHook(handle: Long)
     private external fun postLiveResizeRender(handle: Long)
-    private external fun waitForPresentSlot(device: Long): Boolean
     private external fun waitForComposition()
 
     private external fun flush(context: Long, surface: Long)

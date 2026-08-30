@@ -45,7 +45,6 @@ public:
     gr_cp<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
-    HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
 
@@ -54,10 +53,6 @@ public:
         if (fenceEvent != NULL)
         {
             CloseHandle(fenceEvent);
-        }
-        if (frameLatencyWaitableObject != NULL)
-        {
-            CloseHandle(frameLatencyWaitableObject);
         }
         for (int i = 0; i < BuffersCount; i++)
         {
@@ -111,8 +106,10 @@ public:
         if (SUCCEEDED(result)) {
             swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
         }
-        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
-            frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
+        if (swapChain.get() != nullptr && swapChainFlags != 0) {
+            // A waitable swap chain has its own latency limit. Keep no more than the current frame queued so a burst
+            // of resize messages cannot leave DirectComposition several frames behind the Win32 window geometry.
+            swapChain->SetMaximumFrameLatency(1);
         }
         swapChainFactory4.reset(nullptr);
     }
@@ -696,22 +693,9 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Wait before rendering so Present and the pending Win32 geometry can be submitted during the same composition
-    // interval. Unlike DwmFlush immediately before Present, this does not deliberately put both submissions just
-    // after DWM's frame-collection boundary.
-    JNIEXPORT jboolean JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForPresentSlot(
-        JNIEnv *env, jobject redrawer, jlong devicePtr)
-    {
-        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (!d3dDevice || d3dDevice->frameLatencyWaitableObject == NULL) return JNI_FALSE;
-        return WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE) == WAIT_OBJECT_0
-            ? JNI_TRUE
-            : JNI_FALSE;
-    }
-
-    // Compatibility fallback for systems or drivers that cannot create a frame-latency waitable swap chain. From
-    // the present until the geometry commits, the buffer is the new size and the window is still the old one, so
-    // wait until a composition boundary immediately before Present as the older synchronization strategy did.
+    // From the present until the geometry commits, the buffer is the new size and the window still the old one, and
+    // DWM must not sample in there. Waiting opens that window at the start of a composition interval. The swap chain's
+    // one-frame latency limit prevents earlier resize presents from accumulating behind this synchronized step.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
         JNIEnv *env, jobject redrawer)
     {

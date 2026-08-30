@@ -11,7 +11,7 @@
   - Linux GLX 上下文按窗口实际 Visual 创建(voxzen.2):`redrawer.cc` 的 `createContext` 新增 window 参数,先 `XGetWindowAttributes` 取窗口 Visual,再在 `glXGetFBConfigs` 中按 `GLX_VISUAL_ID` 匹配 FBConfig 用 `glXCreateNewContext` 建上下文;失败回退原 `glXChooseVisual` 路径。修复 KDE Wayland(XWayland)下 OpenGL 透明窗口全透明(CMP-6639;`glXChooseVisual` 选到 24 位 Visual 而 AWT 透明窗口用 32 位 ARGB,`glXMakeCurrent` 不报错但 alpha 通道全 0)
   - Windows Direct3D 同步缩放兼容透明合成(voxzen.2):透明层继续为 `CreateSwapChainForComposition` 使用其强制要求的 `DXGI_SCALING_STRETCH`,避免 `DXGI_SCALING_NONE` 创建失败后回退到不透明 HWND 交换链,保留 Acrylic/Mica 等 DWM 背景材质
   - Windows Direct3D 自定义客户区同步缩放(voxzen.3):当窗口客户区覆盖整个原生窗口时,在调用下层 AWT 窗口过程前保留 `WM_NCCALCSIZE` 的完整候选尺寸,防止 AWT 按系统标题栏/边框扣减后让实时帧和内容子窗口少画右侧、底部区域
-  - Windows Direct3D 低延迟同步缩放(voxzen.4):同步缩放交换链使用 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`,在绘制前等待上一帧完成呈现,让新表面 `Present` 与待提交的 Win32 窗口几何有机会进入同一个 DWM 合成帧;不支持该能力时保留原 `DwmFlush` 路径,透明 DirectComposition/Acrylic 路径不变
+  - Windows Direct3D 低延迟同步缩放(voxzen.5):同步缩放交换链使用 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 并将最大帧延迟设为 1,防止高频拖拽产生的 `Present` 在 DirectComposition 中积压多帧;继续在绘制后用 `DwmFlush` 对齐窗口几何提交,透明 DirectComposition/Acrylic 路径不变
 
 ### CMP 兼容性
 
