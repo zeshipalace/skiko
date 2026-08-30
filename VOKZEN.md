@@ -4,21 +4,21 @@
 
 ## 分支与版本
 
-- 维护分支:`voxzen`,基于上游 tag `v0.150.1`(`3956e988`)——与 Voxzen 使用的 CMP 1.12.0 所编译的 skiko 同源
-- 版本号:`skiko/gradle.properties` 的 `deploy.version`,规则 `0.150.1-voxzen.N`
+- 维护分支:`voxzen`,已合并上游 `master` 至 `29b514873`(包含 `v0.152.0-alpha02` 之后的 5 个提交),使用 Skia `m152-2ca5fe6a81`
+- 版本号:`skiko/gradle.properties` 的 `deploy.version`,规则 `0.152.0-voxzen.N`;主版本跟随 Skia milestone,N 为 Voxzen 发布序号
 - 补丁栈(在基点之上):
-  - cherry-pick 上游 PR [#1282](https://github.com/JetBrains/skiko/pull/1282)(SkiaSwingLayer frame pacing,`skiko.swing.frame.pacing`);`SkikoProperties.kt` 冲突已按本分支的非 lazy 属性风格移植
+  - cherry-pick 上游 PR [#1282](https://github.com/JetBrains/skiko/pull/1282)(SkiaSwingLayer frame pacing,`skiko.swing.frame.pacing`);`SkikoProperties.kt` 已适配上游 lazy 属性风格
   - Linux GLX 上下文按窗口实际 Visual 创建(voxzen.2):`redrawer.cc` 的 `createContext` 新增 window 参数,先 `XGetWindowAttributes` 取窗口 Visual,再在 `glXGetFBConfigs` 中按 `GLX_VISUAL_ID` 匹配 FBConfig 用 `glXCreateNewContext` 建上下文;失败回退原 `glXChooseVisual` 路径。修复 KDE Wayland(XWayland)下 OpenGL 透明窗口全透明(CMP-6639;`glXChooseVisual` 选到 24 位 Visual 而 AWT 透明窗口用 32 位 ARGB,`glXMakeCurrent` 不报错但 alpha 通道全 0)
 
-### 为什么不基于 master
+### CMP 兼容性
 
-master(0.152.x 线)与 CMP 1.12.0 **二进制不兼容**,实测:
+当前分支已进入 master(0.152.x 线),与 CMP 1.12.0 **二进制不兼容**,实测:
 
 - `org.jetbrains.skia.FontMetrics`、`FontStyle` 等已改为 Kotlin value class,实例方法全部变成名称混淆的静态 `-impl` 方法(如 `getAscent-impl([F)`),CMP 1.12.0 的 ui-text/ui-graphics 编译期绑定旧签名 → 运行时 `NoSuchMethodError`,且无法用 shim 桥接(擦除签名完全不同)
 - `RenderNodeContext.<init>(Z)V` 变为 `(ZZ)V`
 - master 还包含 AWT 渲染栈重构(#1234)与 Skia m150→m152 升级
 
-只有当 Voxzen 升级到基于 skiko ≥ 0.152 的 CMP 版本后,才考虑把 `voxzen` 分支 rebase 到 master 系。master 基点的尝试保留在 `voxzen-master` 分支供参考。
+因此 Voxzen 应同时升级到基于 skiko ≥ 0.152 的 CMP 版本,不能把当前产物与 CMP 1.12.0 混用。
 
 ## 本地迭代(开发机)
 
