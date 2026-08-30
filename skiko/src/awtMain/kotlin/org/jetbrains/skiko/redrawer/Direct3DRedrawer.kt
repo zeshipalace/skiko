@@ -127,7 +127,7 @@ internal class Direct3DRedrawer(
             with(scope) { drawFrame() }
             swap(withVsync)
             if (waitForComposition) {
-                waitForComposition(device)
+                waitForComposition()
             }
         }
     }
@@ -292,6 +292,16 @@ internal class Direct3DRedrawer(
     private fun drawFrameWhileLiveResizing(width: Int, height: Int, isResizeFrame: Boolean) {
         WinApiEdtInvoker.invokeAndWaitWhilePumping {
             if (isDisposed) return@invokeAndWaitWhilePumping
+            if (isResizeFrame) {
+                // AWT updates the Window peer before laying out its Swing child hierarchy. ComposeScene reads its
+                // size only from that hierarchy, and ignores SkikoRenderDelegate's width/height arguments. Force the
+                // pending Window size through JRootPane/ComposeWindowPanel/SkiaLayer before recording this frame;
+                // otherwise Compose draws exactly one WM_NCCALCSIZE step behind the surface and window edge.
+                javax.swing.SwingUtilities.getWindowAncestor(layer)?.let { window ->
+                    window.invalidate()
+                    window.validate()
+                }
+            }
             frameHost?.inForcedSizeFrame(Dimension(width, height)) { scope ->
                 if (!isDisposed) { // may be disposed in user code, during `update`
                     drawAndSwap(
@@ -320,7 +330,7 @@ internal class Direct3DRedrawer(
     private external fun installLiveResizeHook(window: Long, content: Long): Long
     private external fun uninstallLiveResizeHook(handle: Long)
     private external fun postLiveResizeRender(handle: Long)
-    private external fun waitForComposition(device: Long)
+    private external fun waitForComposition()
 
     private external fun flush(context: Long, surface: Long)
 }

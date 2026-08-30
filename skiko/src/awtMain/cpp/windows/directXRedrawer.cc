@@ -45,7 +45,6 @@ public:
     gr_cp<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
-    HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
 
@@ -54,10 +53,6 @@ public:
         if (fenceEvent != NULL)
         {
             CloseHandle(fenceEvent);
-        }
-        if (frameLatencyWaitableObject != NULL)
-        {
-            CloseHandle(frameLatencyWaitableObject);
         }
         for (int i = 0; i < BuffersCount; i++)
         {
@@ -111,10 +106,10 @@ public:
         if (SUCCEEDED(result)) {
             swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
         }
-        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
+        if (swapChain.get() != nullptr && swapChainFlags != 0) {
             // A waitable swap chain has its own latency limit. Keep no more than the current frame queued so a burst
             // of resize messages cannot leave DirectComposition several frames behind the Win32 window geometry.
-            frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
+            swapChain->SetMaximumFrameLatency(1);
         }
         swapChainFactory4.reset(nullptr);
     }
@@ -698,25 +693,12 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Called after Present and before WM_NCCALCSIZE returns. ResizeBuffers changes the surface behind the existing
-    // DirectComposition visual, so explicitly re-submit that visual and wait for the transaction to be processed.
-    // Waiting only for DXGI presentation is insufficient here: DXGI can finish while DComp still has the preceding
-    // surface size in its committed visual tree. DwmFlush then carries the processed transaction to a DWM boundary.
+    // Called after Present and before WM_NCCALCSIZE returns, so the matching surface update reaches a DWM boundary
+    // before the new window geometry commits. The swap chain's one-frame latency limit prevents older presents from
+    // accumulating without adding another blocking composition transaction to every resize step.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
-        JNIEnv *env, jobject redrawer, jlong devicePtr)
+        JNIEnv *env, jobject redrawer)
     {
-        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (!d3dDevice) return;
-        if (d3dDevice->dcDevice.get() != nullptr && d3dDevice->dcVisual.get() != nullptr) {
-            if (SUCCEEDED(d3dDevice->dcVisual->SetContent(d3dDevice->swapChain.get())) &&
-                SUCCEEDED(d3dDevice->dcDevice->Commit()))
-            {
-                d3dDevice->dcDevice->WaitForCommitCompletion();
-            }
-        }
-        if (d3dDevice->frameLatencyWaitableObject != NULL) {
-            WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE);
-        }
         DwmFlush();
     }
 
