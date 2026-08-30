@@ -45,6 +45,8 @@ public:
     gr_cp<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
+    HANDLE frameLatencyWaitableObject = NULL;
+    UINT swapChainFlags = 0;
     unsigned int bufferIndex;
 
     ~DirectXDevice()
@@ -52,6 +54,10 @@ public:
         if (fenceEvent != NULL)
         {
             CloseHandle(fenceEvent);
+        }
+        if (frameLatencyWaitableObject != NULL)
+        {
+            CloseHandle(frameLatencyWaitableObject);
         }
         for (int i = 0; i < BuffersCount; i++)
         {
@@ -63,29 +69,51 @@ public:
         device.reset(nullptr);
     }
 
-    void initSwapChain(UINT width, UINT height, jboolean transparency, jboolean preferNoneScaling) {
+    void initSwapChain(UINT width, UINT height, jboolean transparency, jboolean synchronousLiveResize) {
         gr_cp<IDXGIFactory4> swapChainFactory4;
         gr_cp<IDXGISwapChain1> swapChain1;
         CreateDXGIFactory2(0, IID_PPV_ARGS(&swapChainFactory4));
         HRESULT result = S_OK;
+        swapChainFlags = synchronousLiveResize ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
         // CreateSwapChainForComposition requires STRETCH. Transparent layers use that path, so keep STRETCH there
         // even when synchronous live resize is enabled; otherwise creation fails and we fall back to the opaque HWND
         // swap chain. NONE is safe for the HWND path only behind the live-resize pre-render, which fills the content
         // at every new size.
-        DXGI_SCALING scaling = preferNoneScaling && !transparency ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
+        DXGI_SCALING scaling = synchronousLiveResize && !transparency ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
         if (transparency) {
             result = CreateSwapChainForComposition(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            // FRAME_LATENCY_WAITABLE_OBJECT is available since Windows 8.1. If a driver rejects it, retry the same
+            // transparent composition path without the flag rather than losing Acrylic/Mica by falling through to
+            // the opaque HWND swap chain.
+            if (FAILED(result) && swapChainFlags != 0) {
+                swapChain1.reset(nullptr);
+                dcVisual.reset(nullptr);
+                dcTarget.reset(nullptr);
+                dcDevice.reset(nullptr);
+                swapChainFlags = 0;
+                result = CreateSwapChainForComposition(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            }
         }
         if (!transparency || FAILED(result)) {
             /*
              * It's just a fallback path that added for compatibility.
              * In this case transparency won't be supported.
-             */
+            */
             swapChain1.reset(nullptr);
-            CreateSwapChainForHwnd(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            result = CreateSwapChainForHwnd(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            if (FAILED(result) && swapChainFlags != 0) {
+                swapChain1.reset(nullptr);
+                swapChainFlags = 0;
+                result = CreateSwapChainForHwnd(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            }
         }
         swapChainFactory4->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER);
-        swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
+        if (SUCCEEDED(result)) {
+            swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
+        }
+        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
+            frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
+        }
         swapChainFactory4.reset(nullptr);
     }
 
@@ -102,6 +130,7 @@ private:
         swapChainDesc.Scaling = scaling;
         swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        swapChainDesc.Flags = swapChainFlags;
         HRESULT result = swapChainFactory4->CreateSwapChainForComposition(queue.get(), &swapChainDesc, nullptr, swapChain1);
         if (FAILED(result)) { return result; }
 
@@ -132,6 +161,7 @@ private:
         swapChainDesc.BufferCount = BuffersCount;
         swapChainDesc.Scaling = scaling;
         swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        swapChainDesc.Flags = swapChainFlags;
         return swapChainFactory4->CreateSwapChainForHwnd(queue.get(), hWnd, &swapChainDesc, nullptr, nullptr, swapChain1);
     }
 };
@@ -597,12 +627,12 @@ extern "C"
     }
 
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_initSwapChain(
-        JNIEnv *env, jobject redrawer, jlong devicePtr, jint width, jint height, jboolean transparency, jboolean preferNoneScaling)
+        JNIEnv *env, jobject redrawer, jlong devicePtr, jint width, jint height, jboolean transparency, jboolean synchronousLiveResize)
     {
         __try
         {
             DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-            d3dDevice->initSwapChain((UINT) width, (UINT) height, transparency, preferNoneScaling);
+            d3dDevice->initSwapChain((UINT) width, (UINT) height, transparency, synchronousLiveResize);
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
             auto code = GetExceptionCode();
@@ -666,9 +696,22 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // From the present until the geometry commits, the buffer is the new size and the window still the old one, and
-    // DWM must not sample in there. Waiting opens that window at the start of a composition interval, and caps a
-    // high-rate mouse at one step per composition.
+    // Wait before rendering so Present and the pending Win32 geometry can be submitted during the same composition
+    // interval. Unlike DwmFlush immediately before Present, this does not deliberately put both submissions just
+    // after DWM's frame-collection boundary.
+    JNIEXPORT jboolean JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForPresentSlot(
+        JNIEnv *env, jobject redrawer, jlong devicePtr)
+    {
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (!d3dDevice || d3dDevice->frameLatencyWaitableObject == NULL) return JNI_FALSE;
+        return WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE) == WAIT_OBJECT_0
+            ? JNI_TRUE
+            : JNI_FALSE;
+    }
+
+    // Compatibility fallback for systems or drivers that cannot create a frame-latency waitable swap chain. From
+    // the present until the geometry commits, the buffer is the new size and the window is still the old one, so
+    // wait until a composition boundary immediately before Present as the older synchronization strategy did.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
         JNIEnv *env, jobject redrawer)
     {
@@ -697,7 +740,13 @@ extern "C"
                 }
                 d3dDevice->buffers[i].reset(nullptr);
             }
-            d3dDevice->swapChain->ResizeBuffers(BuffersCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+            d3dDevice->swapChain->ResizeBuffers(
+                BuffersCount,
+                width,
+                height,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                d3dDevice->swapChainFlags
+            );
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
             auto code = GetExceptionCode();
