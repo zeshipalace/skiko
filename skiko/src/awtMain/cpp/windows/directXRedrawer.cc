@@ -245,6 +245,14 @@ static SIZE enforcedChildSizeForResizeStep(SIZE pending, SIZE committed) {
     return { std::max(pending.cx, committed.cx), std::max(pending.cy, committed.cy) };
 }
 
+static bool clientAreaFillsWindow(HWND hWnd) {
+    RECT windowRect = {};
+    RECT clientRect = {};
+    if (!GetWindowRect(hWnd, &windowRect) || !GetClientRect(hWnd, &clientRect)) return false;
+    return windowRect.right - windowRect.left == clientRect.right - clientRect.left &&
+           windowRect.bottom - windowRect.top == clientRect.bottom - clientRect.top;
+}
+
 static void applyEnforcedChildSize(LiveResizeState *s) {
     if (!s->contentHwnd) return;
     SetWindowPos(s->contentHwnd, nullptr, 0, 0, s->enforcedChildSize.cx, s->enforcedChildSize.cy,
@@ -290,6 +298,13 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             break;
         }
         case WM_NCCALCSIZE: {
+            NCCALCSIZE_PARAMS *p = wParam ? (NCCALCSIZE_PARAMS *)lParam : nullptr;
+            // Custom-decorated windows can make their client area fill the whole frame. A lower procedure in the
+            // chain (notably AWT's) may still subtract the standard caption and borders from rgrc[0], even though a
+            // later outer procedure restores the full-client result. Preserve the proposed frame rect before
+            // forwarding so the synchronous frame covers the client area that will actually be committed.
+            const bool fullWindowClient = p && clientAreaFillsWindow(hWnd);
+            const RECT proposedFrameRect = p ? p->rgrc[0] : RECT{};
             LRESULT r = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
             // isPumpingEdt(): our own render re-enters here, because the EDT's SetWindowPos is SENT back to this
             // thread. Starting a second round-trip would deadlock against the EDT already blocked in SendMessage.
@@ -300,8 +315,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                     s->liveResizeEngaged = true;
                     javaOnLiveResizeStarted(s); // must quiesce the async EDT renders before the first render here
                 }
-                NCCALCSIZE_PARAMS *p = (NCCALCSIZE_PARAMS *)lParam;
-                RECT c = p->rgrc[0];
+                RECT c = fullWindowClient ? proposedFrameRect : p->rgrc[0];
                 RECT committed; GetClientRect(hWnd, &committed);
                 const SIZE pendingSize = { c.right - c.left, c.bottom - c.top };
                 s->enforcedChildSize = enforcedChildSizeForResizeStep(
