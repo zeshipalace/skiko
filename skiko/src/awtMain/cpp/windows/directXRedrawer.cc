@@ -698,19 +698,26 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Called after Present and before WM_NCCALCSIZE returns. A frame-latency object becomes signaled when DXGI has
-    // finished presenting the queued frame, which is the synchronization point needed here: returning earlier lets
-    // the new window geometry reach the screen while DirectComposition is still showing the preceding buffer.
-    // DwmFlush is retained only for systems or drivers that cannot provide the waitable swap-chain path.
+    // Called after Present and before WM_NCCALCSIZE returns. ResizeBuffers changes the surface behind the existing
+    // DirectComposition visual, so explicitly re-submit that visual and wait for the transaction to be processed.
+    // Waiting only for DXGI presentation is insufficient here: DXGI can finish while DComp still has the preceding
+    // surface size in its committed visual tree. DwmFlush then carries the processed transaction to a DWM boundary.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
         JNIEnv *env, jobject redrawer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (!d3dDevice || d3dDevice->frameLatencyWaitableObject == NULL ||
-            WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE) != WAIT_OBJECT_0)
-        {
-            DwmFlush();
+        if (!d3dDevice) return;
+        if (d3dDevice->dcDevice.get() != nullptr && d3dDevice->dcVisual.get() != nullptr) {
+            if (SUCCEEDED(d3dDevice->dcVisual->SetContent(d3dDevice->swapChain.get())) &&
+                SUCCEEDED(d3dDevice->dcDevice->Commit()))
+            {
+                d3dDevice->dcDevice->WaitForCommitCompletion();
+            }
         }
+        if (d3dDevice->frameLatencyWaitableObject != NULL) {
+            WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE);
+        }
+        DwmFlush();
     }
 
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.

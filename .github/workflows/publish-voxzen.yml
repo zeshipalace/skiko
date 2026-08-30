@@ -18,6 +18,16 @@ name: Voxzen Publish
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Artifacts to publish (use windows first for native iteration, then portable after validation)'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - portable
 
 permissions:
   contents: read
@@ -25,6 +35,7 @@ permissions:
 
 jobs:
   publish-linux:
+    if: inputs.scope != 'windows'
     name: 'Publish (Linux x64 + shared artifacts)'
     runs-on: ubuntu-24.04
     steps:
@@ -56,6 +67,7 @@ jobs:
               publishToVoxzenGitHubPackages
 
   publish-linux-arm64:
+    if: inputs.scope != 'windows'
     name: 'Publish Linux arm64 runtime'
     runs-on: ubuntu-24.04-arm
     steps:
@@ -84,6 +96,7 @@ jobs:
               publishSkikoJvmRuntimeLinuxArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-windows:
+    if: inputs.scope != 'portable'
     name: 'Publish Windows runtimes'
     runs-on: windows-2022
     steps:
@@ -128,6 +141,7 @@ jobs:
             publishSkikoJvmRuntimeWindowsArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-macos:
+    if: inputs.scope != 'windows'
     name: 'Publish macOS runtimes'
     runs-on: macos-15
     steps:
