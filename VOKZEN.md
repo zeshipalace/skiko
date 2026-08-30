@@ -9,6 +9,7 @@
 - 补丁栈(在基点之上):
   - cherry-pick 上游 PR [#1282](https://github.com/JetBrains/skiko/pull/1282)(SkiaSwingLayer frame pacing,`skiko.swing.frame.pacing`);`SkikoProperties.kt` 已适配上游 lazy 属性风格
   - Linux GLX 上下文按窗口实际 Visual 创建(voxzen.2):`redrawer.cc` 的 `createContext` 新增 window 参数,先 `XGetWindowAttributes` 取窗口 Visual,再在 `glXGetFBConfigs` 中按 `GLX_VISUAL_ID` 匹配 FBConfig 用 `glXCreateNewContext` 建上下文;失败回退原 `glXChooseVisual` 路径。修复 KDE Wayland(XWayland)下 OpenGL 透明窗口全透明(CMP-6639;`glXChooseVisual` 选到 24 位 Visual 而 AWT 透明窗口用 32 位 ARGB,`glXMakeCurrent` 不报错但 alpha 通道全 0)
+  - Windows Direct3D 同步缩放兼容透明合成(voxzen.2):透明层继续为 `CreateSwapChainForComposition` 使用其强制要求的 `DXGI_SCALING_STRETCH`,避免 `DXGI_SCALING_NONE` 创建失败后回退到不透明 HWND 交换链,保留 Acrylic/Mica 等 DWM 背景材质
 
 ### CMP 兼容性
 

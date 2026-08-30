@@ -68,9 +68,11 @@ public:
         gr_cp<IDXGISwapChain1> swapChain1;
         CreateDXGIFactory2(0, IID_PPV_ARGS(&swapChainFactory4));
         HRESULT result = S_OK;
-        // NONE is safe only behind the live-resize pre-render, which fills the content at every new size. Otherwise
-        // it would expose a hard uncovered edge on any size change (maximize/snap/DPI/async).
-        DXGI_SCALING scaling = preferNoneScaling ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
+        // CreateSwapChainForComposition requires STRETCH. Transparent layers use that path, so keep STRETCH there
+        // even when synchronous live resize is enabled; otherwise creation fails and we fall back to the opaque HWND
+        // swap chain. NONE is safe for the HWND path only behind the live-resize pre-render, which fills the content
+        // at every new size.
+        DXGI_SCALING scaling = preferNoneScaling && !transparency ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
         if (transparency) {
             result = CreateSwapChainForComposition(swapChainFactory4.get(), width, height, scaling, &swapChain1);
         }
