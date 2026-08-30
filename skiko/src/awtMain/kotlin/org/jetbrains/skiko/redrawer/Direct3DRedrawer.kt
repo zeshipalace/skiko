@@ -6,8 +6,11 @@ import org.jetbrains.skia.impl.InteropPointer
 import org.jetbrains.skia.impl.getPtr
 import org.jetbrains.skia.impl.interopScope
 import org.jetbrains.skiko.*
+import java.awt.Container
 import java.awt.Dimension
+import java.awt.Window
 import java.lang.ref.Reference
+import kotlin.math.roundToInt
 
 internal class Direct3DRedrawer(
     layer: SkiaLayer,
@@ -293,14 +296,7 @@ internal class Direct3DRedrawer(
         WinApiEdtInvoker.invokeAndWaitWhilePumping {
             if (isDisposed) return@invokeAndWaitWhilePumping
             if (isResizeFrame) {
-                // AWT updates the Window peer before laying out its Swing child hierarchy. ComposeScene reads its
-                // size only from that hierarchy, and ignores SkikoRenderDelegate's width/height arguments. Force the
-                // pending Window size through JRootPane/ComposeWindowPanel/SkiaLayer before recording this frame;
-                // otherwise Compose draws exactly one WM_NCCALCSIZE step behind the surface and window edge.
-                javax.swing.SwingUtilities.getWindowAncestor(layer)?.let { window ->
-                    window.invalidate()
-                    window.validate()
-                }
+                layoutLayerHierarchyForLiveResize(width, height)
             }
             frameHost?.inForcedSizeFrame(Dimension(width, height)) { scope ->
                 if (!isDisposed) { // may be disposed in user code, during `update`
@@ -310,6 +306,27 @@ internal class Direct3DRedrawer(
                         waitForComposition = isResizeFrame
                     )
                 }
+            }
+        }
+    }
+
+    private fun layoutLayerHierarchyForLiveResize(width: Int, height: Int) {
+        // AWT updates java.awt.Window's public size only after WM_NCCALCSIZE returns, so Window.validate() here would
+        // still lay everything out at the preceding resize step. The native callback already has the pending client
+        // size. Convert it to AWT logical coordinates, apply it to the fill-window hierarchy below Window, and lay it
+        // out from the root down. ComposeScene then observes the current size when SkiaLayer.doLayout() notifies it.
+        val scale = layer.contentScale.coerceAtLeast(1f)
+        val pendingSize = Dimension(
+            (width / scale).roundToInt(),
+            (height / scale).roundToInt()
+        )
+        val hierarchy = generateSequence<java.awt.Component>(layer) { it.parent }
+            .takeWhile { it !is Window }
+            .toList()
+        hierarchy.asReversed().forEach { component ->
+            component.size = pendingSize
+            if (component is Container) {
+                component.doLayout()
             }
         }
     }
