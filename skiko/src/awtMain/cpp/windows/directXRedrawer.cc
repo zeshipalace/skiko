@@ -45,6 +45,7 @@ public:
     gr_cp<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
+    HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
 
@@ -53,6 +54,10 @@ public:
         if (fenceEvent != NULL)
         {
             CloseHandle(fenceEvent);
+        }
+        if (frameLatencyWaitableObject != NULL)
+        {
+            CloseHandle(frameLatencyWaitableObject);
         }
         for (int i = 0; i < BuffersCount; i++)
         {
@@ -106,10 +111,10 @@ public:
         if (SUCCEEDED(result)) {
             swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
         }
-        if (swapChain.get() != nullptr && swapChainFlags != 0) {
+        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
             // A waitable swap chain has its own latency limit. Keep no more than the current frame queued so a burst
             // of resize messages cannot leave DirectComposition several frames behind the Win32 window geometry.
-            swapChain->SetMaximumFrameLatency(1);
+            frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
         }
         swapChainFactory4.reset(nullptr);
     }
@@ -693,13 +698,19 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Called after Present and before WM_NCCALCSIZE returns. Do not commit the new window geometry until DWM has
-    // consumed the matching surface update; otherwise the window edge can become visible one composition step ahead
-    // of DirectComposition. The swap chain's one-frame latency limit also prevents older presents from accumulating.
+    // Called after Present and before WM_NCCALCSIZE returns. A frame-latency object becomes signaled when DXGI has
+    // finished presenting the queued frame, which is the synchronization point needed here: returning earlier lets
+    // the new window geometry reach the screen while DirectComposition is still showing the preceding buffer.
+    // DwmFlush is retained only for systems or drivers that cannot provide the waitable swap-chain path.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
-        JNIEnv *env, jobject redrawer)
+        JNIEnv *env, jobject redrawer, jlong devicePtr)
     {
-        DwmFlush();
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (!d3dDevice || d3dDevice->frameLatencyWaitableObject == NULL ||
+            WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 1000, FALSE) != WAIT_OBJECT_0)
+        {
+            DwmFlush();
+        }
     }
 
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.
