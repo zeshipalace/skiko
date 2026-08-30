@@ -1,6 +1,5 @@
 package org.jetbrains.skiko
 
-import kotlinx.browser.window
 import org.jetbrains.skia.*
 import org.jetbrains.skia.impl.NativePointer
 import org.jetbrains.skiko.wasm.ContextAttributes
@@ -15,9 +14,17 @@ import org.w3c.dom.HTMLCanvasElement
  */
 internal abstract class CanvasRenderer(
     private val contextPointer: NativePointer,
-    val width: Int,
-    val height: Int,
+    width: Int,
+    height: Int,
 ) {
+    var width: Int = width
+        private set
+    var height: Int = height
+        private set
+
+    var isDisposed: Boolean = false
+        private set
+
     private val context: DirectContext
     private var surface: Surface? = null
     private var renderTarget: BackendRenderTarget? = null
@@ -35,7 +42,24 @@ internal abstract class CanvasRenderer(
         initCanvas()
     }
 
+    private val requestAnimationFrameCallback: (timestamp: Double) -> Unit = callback@{ timestamp ->
+        redrawScheduled = false
+        if (isDisposed) return@callback
+
+        GL.makeContextCurrent(contextPointer)
+        // `clear` and `resetMatrix` make canvas not accumulate previous effects
+        canvas?.clear(Color.WHITE)
+        canvas?.resetMatrix()
+        drawFrame(timestamp)
+        surface?.flushAndSubmit()
+        context.flush()
+    }
+
+    /**
+     * (Re)creates the render target, surface and [canvas] at the current [width]/[height].
+     */
     fun initCanvas() {
+        GL.makeContextCurrent(contextPointer)
         disposeCanvas()
 
         renderTarget = BackendRenderTarget.makeGL(width, height, 1, 8, 0, 0x8058)
@@ -50,11 +74,44 @@ internal abstract class CanvasRenderer(
         canvas = surface!!.canvas
     }
 
+    /**
+     * Frees the surface and render target.
+     */
     private fun disposeCanvas() {
+        GL.makeContextCurrent(contextPointer)
         surface?.close()
         surface = null
         renderTarget?.close()
         renderTarget = null
+    }
+
+    /**
+     * Recreates the render target and surface at the new size, reusing the existing
+     * WebGL context and [DirectContext].
+     *
+     * Must be called after the canvas element's `width`/`height` attributes change:
+     * that resets the WebGL drawing buffer, while the Skia surface keeps targeting
+     * the default framebuffer with the old dimensions.
+     */
+    fun resize(width: Int, height: Int) {
+        check(!isDisposed) { "CanvasRenderer is disposed" }
+        if (width == this.width && height == this.height) return
+        this.width = width
+        this.height = height
+        initCanvas()
+    }
+
+    /**
+     * Releases the GPU resources. The renderer can't be used afterwards;
+     * a frame already scheduled via [needRedraw] becomes a no-op.
+     */
+    fun dispose() {
+        if (isDisposed) return
+        isDisposed = true
+        GL.makeContextCurrent(contextPointer)
+        disposeCanvas()
+        canvas = null
+        context.close()
     }
 
     /**
@@ -69,23 +126,21 @@ internal abstract class CanvasRenderer(
     /**
      * Schedules a call to [drawFrame] to the appropriate moment.
      */
+    @OptIn(ExperimentalWasmJsInterop::class)
     fun needRedraw() {
-        if (redrawScheduled) {
+        if (isDisposed || redrawScheduled) {
             return
         }
         redrawScheduled = true
-        window.requestAnimationFrame { timestamp ->
-            redrawScheduled = false
-            GL.makeContextCurrent(contextPointer)
-            // `clear` and `resetMatrix` make canvas not accumulate previous effects
-            canvas?.clear(Color.WHITE)
-            canvas?.resetMatrix()
-            drawFrame(timestamp)
-            surface?.flushAndSubmit()
-            context.flush()
-        }
+        windowRequestAnimationFrame(requestAnimationFrameCallback)
     }
 }
+
+@OptIn(ExperimentalWasmJsInterop::class)
+private fun windowRequestAnimationFrame(callback: (Double) -> Unit) : Int =
+    //language=JavaScript
+    js("window.requestAnimationFrame(callback)")
+
 
 internal external interface GLInterface {
     fun createContext(context: HTMLCanvasElement, contextAttributes: ContextAttributes): NativePointer

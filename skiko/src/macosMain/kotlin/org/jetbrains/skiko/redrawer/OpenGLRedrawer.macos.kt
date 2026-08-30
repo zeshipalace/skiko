@@ -9,6 +9,7 @@ import org.jetbrains.skiko.FrameDispatcher
 import org.jetbrains.skiko.SkiaLayer
 import org.jetbrains.skiko.SkikoDispatchers
 import org.jetbrains.skiko.context.ContextHandler
+import org.jetbrains.skiko.context.draw
 import org.jetbrains.skiko.context.MacOSOpenGLContextHandler
 import org.jetbrains.skiko.currentNanoTime
 import platform.CoreFoundation.CFTimeInterval
@@ -46,7 +47,7 @@ internal class MacOsOpenGLRedrawer(
         glLayer.dispose()
     }
 
-    override fun syncBounds() {
+    override fun syncBoundsFromPlatformComponent() {
         syncContentScale()
         skiaLayer.nsView.frame.useContents {
             glLayer.setFrame(
@@ -134,7 +135,7 @@ internal class MacosGLLayer : CAOpenGLLayer {
         try {
             skiaLayer.update(currentNanoTime())
             skiaLayer.inDrawScope {
-                contextHandler.draw()
+                draw(contextHandler)
             }
         } catch (e: Throwable) {
             e.printStackTrace()
