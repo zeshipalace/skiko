@@ -125,10 +125,10 @@ internal class Direct3DRedrawer(
                 return
             }
             with(scope) { drawFrame() }
+            swap(withVsync)
             if (waitForComposition) {
                 waitForComposition()
             }
-            swap(withVsync)
         }
     }
 

@@ -693,9 +693,9 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // From the present until the geometry commits, the buffer is the new size and the window still the old one, and
-    // DWM must not sample in there. Waiting opens that window at the start of a composition interval. The swap chain's
-    // one-frame latency limit prevents earlier resize presents from accumulating behind this synchronized step.
+    // Called after Present and before WM_NCCALCSIZE returns. Do not commit the new window geometry until DWM has
+    // consumed the matching surface update; otherwise the window edge can become visible one composition step ahead
+    // of DirectComposition. The swap chain's one-frame latency limit also prevents older presents from accumulating.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_Direct3DRedrawer_waitForComposition(
         JNIEnv *env, jobject redrawer)
     {
