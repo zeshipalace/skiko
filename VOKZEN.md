@@ -13,6 +13,7 @@
   - Windows Direct3D 自定义客户区同步缩放(voxzen.3):当窗口客户区覆盖整个原生窗口时,在调用下层 AWT 窗口过程前保留 `WM_NCCALCSIZE` 的完整候选尺寸,防止 AWT 按系统标题栏/边框扣减后让实时帧和内容子窗口少画右侧、底部区域
   - Windows Direct3D 低延迟同步缩放(voxzen.10):同步缩放交换链使用 `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 并将最大帧延迟设为 1,防止高频拖拽产生的 `Present` 积压;每个 resize frame 在录制前用 native 候选客户区尺寸除以 DPI,直接更新 Window 以下的 `JRootPane`/`ComposeWindowPanel`/`SkiaLayer` fill-window 层级并自上而下布局,绕过 `WM_NCCALCSIZE` 返回前 `java.awt.Window` 仍是旧尺寸的时序,修复 ComposeScene 落后一个 resize step;`Present` 后以 `DwmFlush` 对齐 DWM 边界,透明 DirectComposition/Acrylic 路径不变
   - Linux 多窗口并行 vsync 交换(voxzen.11):`LinuxOpenGLRedrawer` 批量交换阶段原本只有单窗口 interval=1、其余窗口 interval=0;NVIDIA 闭源驱动 XWayland 下 interval=0 的立即呈现会把仍在显示的缓冲交还应用重绘,透明窗口每帧 `clear(Color.TRANSPARENT)` 直接落在可见缓冲上,整窗随重绘闪透明(指针进出桌面歌词窗口稳定触发)。改为全部 vsync 窗口 interval=1 呈现;多 vsync 窗口时交换分发到守护线程池并行阻塞各自 vblank,新增 `releaseCurrent` 在调度线程与工作线程间移交 GLX 上下文(上下文同一时间只能绑定一个线程),任意刷新率下各窗口均可跑满各自 vblank(300Hz 实测双窗口各 ~296fps 且无闪烁)
+  - macOS Metal 高频缩放帧合并(voxzen.12):实时缩放中的 bounds 帧已经会推进 Compose 动画,不再让动画请求与高频 bounds 变化交替执行完整的同步 EDT 渲染;动画帧等待 bounds 空闲 50ms 后恢复,连续拖动时优先处理最新窗口尺寸,避免拖动越久输入越滞后
 
 ### CMP 兼容性
 
