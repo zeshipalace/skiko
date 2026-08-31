@@ -3,6 +3,7 @@ package org.jetbrains.skiko.redrawer
 import kotlinx.coroutines.*
 import org.jetbrains.skia.*
 import org.jetbrains.skiko.*
+import org.jetbrains.skiko.context.OpenGLContextHandler
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 
@@ -10,10 +11,16 @@ internal class LinuxOpenGLRedrawer(
     layer: SkiaLayer,
     analytics: SkiaLayerAnalytics,
     private val properties: SkiaLayerProperties
-) : AbstractOpenGLRedrawer(layer, analytics) {
+) : AbstractOpenGLRedrawer(layer, analytics), Redrawer {
     init {
         loadOpenGLLibrary()
     }
+
+    // 顶层 Redrawer 必须保持本类名与 contextHandler/context 字段,这是 mediamp
+    // (SkiaOpenGLInterop) 按 Skiko 0.9.37.4 布局反射 GLX 互操作环境的契约;
+    // 帧循环行为不变,全部委托给内部的 OnScreenRedrawer
+    private val frameLoop = OnScreenRedrawer(layer, this)
+    private val contextHandler = OpenGLContextHandler()
 
     private var context = 0L
     private val swapInterval = if (properties.isVsyncEnabled) 1 else 0
@@ -85,6 +92,21 @@ internal class LinuxOpenGLRedrawer(
             it.destroyContext(context)
         }
     }
+
+    override fun onGlContextChanged(context: DirectContext?) {
+        contextHandler.context = context
+    }
+
+    // Redrawer 委托:帧循环仍由内部 OnScreenRedrawer 承载,行为与 #1234 重构后一致
+    // setVisible 与 AWTRedrawer 成员同签名且两边都有默认实现,必须显式消歧;
+    // 不能委托给 frameLoop,否则 OnScreenRedrawer 回调 renderer.setVisible 形成死循环
+    override fun setVisible(isVisible: Boolean) = super<AbstractOpenGLRedrawer>.setVisible(isVisible)
+    override fun dispose() = frameLoop.dispose()
+    override fun needRender(throttledToVsync: Boolean) = frameLoop.needRender(throttledToVsync)
+    override fun renderImmediately() = frameLoop.renderImmediately()
+    override fun syncBoundsFromPlatformComponent() = frameLoop.syncBoundsFromPlatformComponent()
+    override fun update(nanoTime: Long) = frameLoop.update(nanoTime)
+    override fun onLayerComponentResized() = frameLoop.onLayerComponentResized()
 
     override suspend fun renderFrame(scope: LayerDrawScope, immediate: Boolean) {
         layer.backedLayer.lockLinuxDrawingSurface {
