@@ -106,6 +106,15 @@ extern "C"
         glXSwapBuffers(display, window);
     }
 
+    // 解除当前线程的 GLX 上下文绑定。GLX 上下文同一时间只能绑定一个线程，
+    // 并行交换（见 LinuxOpenGLRedrawer）在调度线程与工作线程之间移交上下文前必须调用
+    JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_releaseCurrent(JNIEnv *env, jobject redrawer, jlong displayPtr)
+    {
+        Display *display = fromJavaPointer<Display *>(displayPtr);
+
+        glXMakeCurrent(display, None, NULL);
+    }
+
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_LinuxOpenGLRedrawerKt_makeCurrent(JNIEnv *env, jobject redrawer, jlong displayPtr, jlong windowPtr, jlong contextPtr)
     {
         Display *display = fromJavaPointer<Display *>(displayPtr);

@@ -38,10 +38,16 @@ internal abstract class AbstractOpenGLRedrawer(
         glContext?.flush()
     }
 
+    /**
+     * glContext 创建或销毁后的通知,供子类把当前 [DirectContext] 同步给外部契约
+     */
+    protected open fun onGlContextChanged(context: DirectContext?) {}
+
     protected fun disposeGlResources() {
         disposeSurface()
         glContext?.close()
         glContext = null
+        onGlContextChanged(null)
     }
 
     private fun ensureContext(): Boolean {
@@ -49,6 +55,7 @@ internal abstract class AbstractOpenGLRedrawer(
             try {
                 val newContext = makeGLContext()
                 glContext = newContext
+                onGlContextChanged(newContext)
                 onContextInitialized(newContext, layer.properties.gpuResourceCacheLimit) { renderInfo }
             } catch (e: Exception) {
                 Logger.warn(e) { "Failed to create Skia OpenGL context!" }

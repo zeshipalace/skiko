@@ -23,6 +23,14 @@
 // Defined later in this file; forward-declared so AWTMetalLayer (below) can use it.
 static void javaDrawFrameWhileLiveResizing(jobject redrawer, jint width, jint height);
 
+@interface AWTMetalLayer ()
+
+/// Updated whenever setBounds receives a live-resize size. Animation-driven frames wait for a short
+/// bounds-idle interval so they don't compete with pointer-driven frames for the AppKit and EDT threads.
+@property CFTimeInterval lastLiveResizeBoundsChangeTime;
+
+@end
+
 @implementation AWTMetalLayer
 
 - (id)init
@@ -61,6 +69,7 @@ static void javaDrawFrameWhileLiveResizing(jobject redrawer, jint width, jint he
         return;
     }
 
+    self.lastLiveResizeBoundsChangeTime = CACurrentMediaTime();
     self.drawableSize = pixelSize;
 
     javaDrawFrameWhileLiveResizing(self.javaRef, (jint)pixelSize.width, (jint)pixelSize.height);
@@ -277,6 +286,7 @@ JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_redrawer_MetalRedrawer_createMe
                     }
                     strongDevice.layer.presentsWithTransaction = YES;
                     strongDevice.layer.liveResizing = YES;
+                    strongDevice.layer.lastLiveResizeBoundsChangeTime = 0;
                     javaOnLiveResizeStarted(strongDevice.layer.javaRef);
                 }];
             device.liveResizeEndObserver =
@@ -304,16 +314,51 @@ JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_redrawer_MetalRedrawer_createMe
     }
 }
 
+/// A bounds-driven frame already advances Compose animations. Delay an animation-only frame until
+/// pointer-driven bounds changes have been idle briefly, otherwise both sources alternate expensive
+/// synchronous EDT renders and the window increasingly trails the pointer.
+static const CFTimeInterval liveResizeBoundsIdleInterval = 0.05;
+
+static void runScheduledLiveResizeAnimationFrame(MetalDevice *device) {
+    if (!device.inLiveResize) {
+        atomic_store(&device->frameOnAppKitThreadScheduled, false);
+        return;
+    }
+
+    CFTimeInterval lastBoundsChangeTime = device.layer.lastLiveResizeBoundsChangeTime;
+    if (lastBoundsChangeTime > 0) {
+        CFTimeInterval elapsed = CACurrentMediaTime() - lastBoundsChangeTime;
+        CFTimeInterval remaining = liveResizeBoundsIdleInterval - elapsed;
+        if (remaining > 0) {
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)),
+                dispatch_get_main_queue(),
+                ^{ runScheduledLiveResizeAnimationFrame(device); }
+            );
+            return;
+        }
+    }
+
+    /// Clear before drawing so an onRender -> needRender call can arm the next animation frame.
+    atomic_store(&device->frameOnAppKitThreadScheduled, false);
+
+    CGSize size = device.layer.drawableSize;
+    int pixelWidth = (int) size.width;
+    int pixelHeight = (int) size.height;
+    if (pixelWidth <= 0 || pixelHeight <= 0) {
+        return;
+    }
+    javaDrawFrameWhileLiveResizing(device.layer.javaRef, (jint)pixelWidth, (jint)pixelHeight);
+}
+
 /// Schedules a frame on the AppKit main thread. Called from Kotlin (MetalRedrawer.needRender) during a live resize,
 // when the background frame loop is gated off. The main queue serializes this with setBounds-driven frames, so there
-// is only ever one presenter and one drawable in flight — no async present, no drawable-pool contention. The current
-// pixel size is read on the main thread right before the callback, so the frame is rendered at the layer's live size.
+// is only ever one presenter and one drawable in flight — no async present, no drawable-pool contention. Animation
+// frames are also coalesced behind active pointer-driven bounds frames, which already advance the animation.
 JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_MetalRedrawer_scheduleFrameOnAppKitThread(
     JNIEnv *env, jobject redrawer, jlong devicePtr)
 {
     MetalDevice *device = (__bridge MetalDevice *) (void *) devicePtr;
-    /// javaRef is a global ref (created in createMetalDevice), safe to use from the deferred block.
-    jobject javaRef = device.layer.javaRef;
     /// Coalesce: only dispatch if no resize frame is already pending. atomic_exchange returns the prior
     /// value, so a `true` return means one is in flight and we skip. Scheduling may come from the EDT or
     /// the main thread, hence the atomic.
@@ -321,21 +366,7 @@ JNIEXPORT void JNICALL Java_org_jetbrains_skiko_redrawer_MetalRedrawer_scheduleF
         return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        /// Clear FIRST, unconditionally — before any guard below can bail. This keeps the flag honest
-        /// even when the frame is dropped (e.g. the resize already ended), so a later resize can schedule
-        /// again; and it lets an onRender -> needRender inside drawFrameWhileLiveResizing re-arm the next frame,
-        /// sustaining the animation while the pointer is held still.
-        atomic_store(&device->frameOnAppKitThreadScheduled, false);
-        if (!device.inLiveResize) {
-            return;
-        }
-        CGSize size = device.layer.drawableSize;
-        int pixelWidth = (int) size.width;
-        int pixelHeight = (int) size.height;
-        if (pixelWidth <= 0 || pixelHeight <= 0) {
-            return;
-        }
-        javaDrawFrameWhileLiveResizing(javaRef, (jint)pixelWidth, (jint)pixelHeight);
+        runScheduledLiveResizeAnimationFrame(device);
     });
 }
 

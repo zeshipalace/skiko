@@ -8,11 +8,17 @@ actual fun setSystemLookAndFeel() = UIManager.setLookAndFeel(UIManager.getSystem
 internal actual fun makeDefaultRenderFactory(): RenderFactory =
     RenderFactory { layer, renderApi, analytics, properties ->
         val context = createRedrawer(layer, renderApi, analytics, properties)
-        try {
-            OnScreenRedrawer(layer, context)
-        } catch (e: Throwable) {
-            context.close()
-            throw e
+        // LinuxOpenGLRedrawer 自身实现 Redrawer 并直接作为顶层 redrawer,
+        // 保持类名与字段布局满足 mediamp 的 GLX 互操作反射契约
+        if (context is LinuxOpenGLRedrawer) {
+            context
+        } else {
+            try {
+                OnScreenRedrawer(layer, context)
+            } catch (e: Throwable) {
+                context.close()
+                throw e
+            }
         }
     }
 
