@@ -1,7 +1,7 @@
 package org.jetbrains.skiko.swing
 
 import org.jetbrains.skiko.*
-import org.jetbrains.skiko.redrawer.RedrawerManager
+import org.jetbrains.skiko.renderer.RenderApiFallbackManager
 import java.awt.Component
 import java.awt.Graphics
 import java.awt.Graphics2D
@@ -63,21 +63,21 @@ open class SkiaSwingLayer(
             get() = this@SkiaSwingLayer.properties.gpuResourceCacheLimit
     }
 
-    private val redrawerManager = RedrawerManager<SwingRedrawer>(
+    private val rendererManager = RenderApiFallbackManager<SwingRenderer>(
         properties.renderApi,
-        redrawerFactory = { renderApi, oldRedrawer ->
-            oldRedrawer?.dispose()
-            createSwingRedrawer(swingLayerProperties, renderDelegateWithClipping, renderApi, analytics)
+        factory = { renderApi, oldRenderer ->
+            oldRenderer?.dispose()
+            createSwingRenderer(swingLayerProperties, renderDelegateWithClipping, renderApi, analytics)
         }
     )
 
-    private val redrawer: SwingRedrawer?
-        get() = redrawerManager.redrawer
+    private val renderer: SwingRenderer?
+        get() = rendererManager.current
 
     private var repaintPacer: SwingRepaintPacer? = null
 
     val renderApi: GraphicsApi
-        get() = redrawerManager.renderApi
+        get() = rendererManager.renderApi
 
     init {
         isOpaque = false
@@ -98,7 +98,7 @@ open class SkiaSwingLayer(
 
     private fun init(recreation: Boolean = false) {
         isDisposed = false
-        redrawerManager.findNextWorkingRenderApi(recreation)
+        rendererManager.findNextWorkingRenderApi(recreation)
         repaintPacer?.dispose()
         repaintPacer = if (SkikoProperties.swingFramePacingEnabled) SwingRepaintPacer(this) else null
         isInitialized = true
@@ -109,9 +109,9 @@ open class SkiaSwingLayer(
         if (isInitialized && !isDisposed) {
             repaintPacer?.dispose()
             repaintPacer = null
-            // we should dispose redrawer first (to cancel `draw` in rendering thread)
-            redrawer?.dispose()
-            redrawerManager.dispose()
+            // we should dispose renderer first (to cancel `draw` in rendering thread)
+            renderer?.dispose()
+            rendererManager.dispose()
             isDisposed = true
         }
     }
@@ -141,11 +141,11 @@ open class SkiaSwingLayer(
 
     override fun paint(g: Graphics) {
         try {
-            redrawer?.redraw(g as Graphics2D)
+            renderer?.redraw(g as Graphics2D)
         } catch (e: RenderException) {
             if (!isDisposed) {
                 Logger.warn(e) { "Exception in draw scope" }
-                redrawerManager.findNextWorkingRenderApi()
+                rendererManager.findNextWorkingRenderApi()
                 repaint()
             }
         }
