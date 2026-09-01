@@ -16,6 +16,7 @@ internal open class LinuxOpenGLRenderer(
     }
 
     private var context = 0L
+    protected val nativeContext get() = context
     private val swapInterval = if (properties.isVsyncEnabled) 1 else 0
 
     private var lockedDrawingSurface: LinuxDrawingSurface? = null

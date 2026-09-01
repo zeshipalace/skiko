@@ -19,6 +19,7 @@ internal class LinuxOpenGLRedrawer(
     properties: SkiaLayerProperties
 ) : LinuxOpenGLRenderer(layer, analytics, properties) {
     private val contextHandler = OpenGLContextHandler()
+    private val context = nativeContext
 
     override fun onGlContextChanged(context: DirectContext?) {
         contextHandler.context = context
