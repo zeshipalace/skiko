@@ -48,6 +48,7 @@ public:
     HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
+    UINT lastSubmittedPresentCount = 0;
 
     ~DirectXDevice()
     {
@@ -787,7 +788,9 @@ extern "C"
 
     // Called after Present and before the pending HWND geometry is committed. The DirectComposition visual has no
     // property changes to commit here; what must finish is the D3D12 work that produced this swap-chain buffer. Once
-    // its queue fence completes, a DWM boundary can pick up the fully rendered frame instead of the preceding buffer.
+    // its queue fence completes, wait until flip-model presentation statistics confirm that DWM displayed this exact
+    // Present. GetFrameStatistics can initially be disjoint and can lag behind hardware flip queues, so DwmFlush also
+    // advances/reconciles the statistics; the deadline keeps unsupported multi-monitor/driver cases from hanging.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
@@ -799,7 +802,17 @@ extern "C"
                 WaitForSingleObjectEx(d3dDevice->fenceEvent, INFINITE, FALSE);
             }
         }
-        DwmFlush();
+        const UINT targetPresentCount = d3dDevice ? d3dDevice->lastSubmittedPresentCount : 0;
+        const ULONGLONG deadline = GetTickCount64() + 100;
+        do {
+            DwmFlush();
+            if (!d3dDevice || !d3dDevice->swapChain.get() || targetPresentCount == 0) break;
+            DXGI_FRAME_STATISTICS statistics = {};
+            if (SUCCEEDED(d3dDevice->swapChain->GetFrameStatistics(&statistics)) &&
+                static_cast<INT>(statistics.PresentCount - targetPresentCount) >= 0) {
+                break;
+            }
+        } while (GetTickCount64() < deadline);
     }
 
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.
@@ -846,7 +859,10 @@ extern "C"
             DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
             // 1 value in [Present(1, 0)] enables vblank wait so this is how vertical sync works in DirectX.
             const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
-            d3dDevice->swapChain->Present((int)isVsyncEnabled, 0);
+            const HRESULT presentResult = d3dDevice->swapChain->Present((int)isVsyncEnabled, 0);
+            if (SUCCEEDED(presentResult)) {
+                d3dDevice->swapChain->GetLastPresentCount(&d3dDevice->lastSubmittedPresentCount);
+            }
             d3dDevice->queue->Signal(d3dDevice->fence.get(), fenceValue);
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
