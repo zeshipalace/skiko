@@ -180,6 +180,7 @@ struct LiveResizeState {
     jobject renderer = nullptr;
     SIZE lastFrameClientSize = {};
     SIZE enforcedChildSize = {};    // what the child is held at during a drag; see enforcedChildSizeForResizeStep
+    SIZE preRenderedFrameSize = {}; // full-client frame rendered from WM_WINDOWPOSCHANGING, before geometry changes
     bool inSizeMoveLoop = false;    // WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE, which covers plain moves too
     bool liveResizeEngaged = false; // ...whereas this means an actual resize
     bool detached = false;          // uninstalled, but a proc we couldn't remove still needs us to forward; see below
@@ -292,6 +293,22 @@ static void applyEnforcedChildSize(LiveResizeState *s) {
                  SWP_NOCOPYBITS | SWP_NOREDRAW);
 }
 
+static void renderPendingResizeFrame(LiveResizeState *s, SIZE pendingSize) {
+    if (!s->liveResizeEngaged)
+    {
+        s->liveResizeEngaged = true;
+        javaOnLiveResizeStarted(s); // must quiesce the async EDT renders before the first render here
+    }
+    RECT committed; GetClientRect(s->frameHwnd, &committed);
+    s->enforcedChildSize = enforcedChildSizeForResizeStep(
+        pendingSize,
+        { committed.right - committed.left, committed.bottom - committed.top }
+    );
+    s->lastFrameClientSize = pendingSize;
+    applyEnforcedChildSize(s);
+    javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ true);
+}
+
 // DXGI clips the presented buffer to the child, so the child's size AT THE PRESENT bounds what reaches the screen.
 // This prevents the wrong size from being applied to the child during live resize.
 static LRESULT CALLBACK LiveResizeContentWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -329,11 +346,29 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         case WM_ENTERSIZEMOVE: {
             s->inSizeMoveLoop = true;
             s->liveResizeEngaged = false;
+            s->preRenderedFrameSize = {};
             RECT rc; GetClientRect(hWnd, &rc);
             const SIZE clientSize = { rc.right - rc.left, rc.bottom - rc.top };
             s->enforcedChildSize = enforcedChildSizeForResizeStep(clientSize, clientSize);
             s->lastFrameClientSize = clientSize;
             break;
+        }
+        case WM_WINDOWPOSCHANGING: {
+            WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
+            // For custom-decorated windows whose client fills the frame, WINDOWPOS already carries the exact next
+            // client size and arrives before WM_NCCALCSIZE. Render here while GetWindowRect and DWM still expose the
+            // committed geometry; otherwise a screen sampler (and, on a fast drag, the user) can observe the new
+            // outer edge during the few milliseconds spent laying out and presenting from WM_NCCALCSIZE.
+            LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
+            if (
+                s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
+                windowPos->cx > 0 && windowPos->cy > 0 && clientAreaFillsWindow(hWnd) && !isPumpingEdt()
+            ) {
+                const SIZE pendingSize = { windowPos->cx, windowPos->cy };
+                renderPendingResizeFrame(s, pendingSize);
+                s->preRenderedFrameSize = pendingSize;
+            }
+            return result;
         }
         case WM_NCCALCSIZE: {
             NCCALCSIZE_PARAMS *p = wParam ? (NCCALCSIZE_PARAMS *)lParam : nullptr;
@@ -349,21 +384,14 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             bool renderedResizeFrame = false;
             if (s->inSizeMoveLoop && wParam && !isPumpingEdt())
             {
-                if (!s->liveResizeEngaged)
-                {
-                    s->liveResizeEngaged = true;
-                    javaOnLiveResizeStarted(s); // must quiesce the async EDT renders before the first render here
-                }
                 RECT c = fullWindowClient ? proposedFrameRect : p->rgrc[0];
-                RECT committed; GetClientRect(hWnd, &committed);
                 const SIZE pendingSize = { c.right - c.left, c.bottom - c.top };
-                s->enforcedChildSize = enforcedChildSizeForResizeStep(
-                    pendingSize, 
-                    { committed.right - committed.left, committed.bottom - committed.top }
-                );
-                s->lastFrameClientSize = pendingSize;
-                applyEnforcedChildSize(s);
-                javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ true);
+                const bool alreadyRendered =
+                    s->preRenderedFrameSize.cx == pendingSize.cx && s->preRenderedFrameSize.cy == pendingSize.cy;
+                if (!alreadyRendered) {
+                    renderPendingResizeFrame(s, pendingSize);
+                }
+                s->preRenderedFrameSize = {};
                 renderedResizeFrame = true;
             }
             // WM_NCCALCSIZE otherwise preserves/copies the old client image into the resized window. We have already
@@ -386,6 +414,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             break;
         case WM_EXITSIZEMOVE:
             s->inSizeMoveLoop = false;
+            s->preRenderedFrameSize = {};
             if (s->liveResizeEngaged) {
                 s->liveResizeEngaged = false;
                 // Ensure the client size is correct when exiting live resize mode
