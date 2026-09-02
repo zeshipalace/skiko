@@ -353,20 +353,57 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->lastFrameClientSize = clientSize;
             break;
         }
+        case WM_SIZING: {
+            // WM_SIZING precedes SetWindowPos and carries the dragged outer rectangle. Full-client custom windows
+            // map that rectangle directly to their next client size, so rendering here gives DirectComposition a
+            // complete frame one message earlier than WM_WINDOWPOSCHANGING can. The latter remains as a fallback for
+            // programmatic resizes and for lower window procedures that adjust this proposed rectangle.
+            RECT *proposedRect = (RECT *)lParam;
+            if (s->inSizeMoveLoop && proposedRect && clientAreaFillsWindow(hWnd) && !isPumpingEdt()) {
+                const SIZE pendingSize = {
+                    proposedRect->right - proposedRect->left,
+                    proposedRect->bottom - proposedRect->top
+                };
+                const bool alreadyRendered =
+                    s->preRenderedFrameSize.cx == pendingSize.cx && s->preRenderedFrameSize.cy == pendingSize.cy;
+                if (pendingSize.cx > 0 && pendingSize.cy > 0 && !alreadyRendered) {
+                    renderPendingResizeFrame(s, pendingSize);
+                    s->preRenderedFrameSize = pendingSize;
+                }
+            }
+            break;
+        }
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
             // For custom-decorated windows whose client fills the frame, WINDOWPOS already carries the exact next
             // client size and arrives before WM_NCCALCSIZE. Render here while GetWindowRect and DWM still expose the
             // committed geometry; otherwise a screen sampler (and, on a fast drag, the user) can observe the new
             // outer edge during the few milliseconds spent laying out and presenting from WM_NCCALCSIZE.
-            LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
             if (
                 s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
                 windowPos->cx > 0 && windowPos->cy > 0 && clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
                 const SIZE pendingSize = { windowPos->cx, windowPos->cy };
-                renderPendingResizeFrame(s, pendingSize);
-                s->preRenderedFrameSize = pendingSize;
+                const bool alreadyRendered =
+                    s->preRenderedFrameSize.cx == pendingSize.cx && s->preRenderedFrameSize.cy == pendingSize.cy;
+                if (!alreadyRendered) {
+                    renderPendingResizeFrame(s, pendingSize);
+                    s->preRenderedFrameSize = pendingSize;
+                }
+            }
+            LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
+            // The original procedure may constrain WINDOWPOS. Render its adjusted size before returning as well.
+            if (
+                s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
+                windowPos->cx > 0 && windowPos->cy > 0 && clientAreaFillsWindow(hWnd) && !isPumpingEdt()
+            ) {
+                const SIZE adjustedSize = { windowPos->cx, windowPos->cy };
+                const bool alreadyRendered =
+                    s->preRenderedFrameSize.cx == adjustedSize.cx && s->preRenderedFrameSize.cy == adjustedSize.cy;
+                if (!alreadyRendered) {
+                    renderPendingResizeFrame(s, adjustedSize);
+                    s->preRenderedFrameSize = adjustedSize;
+                }
             }
             return result;
         }
