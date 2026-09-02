@@ -17,6 +17,7 @@
   - Linux 顶层 redrawer 兼容契约(voxzen.13):mediamp(`SkiaOpenGLInterop`)与 Voxzen GPU 缓存控制按 0.9.37.4 布局反射 `SkiaLayer.getRedrawer$skiko`、`LinuxOpenGLRedrawer` 类名、`contextHandler`/`context` 字段及 `LinuxOpenGLRedrawerKt.access$makeCurrent`。同步上游 #1273 后,保留旧包名的 `LinuxOpenGLRedrawer` 作为新 `LinuxOpenGLRenderer` 的轻量子类,`SkiaLayer` 兼容 getter 返回当前 renderer,`ContextHandler` shim 继续同步 `DirectContext`,旧 `access$makeCurrent` 委托到新 renderer 的 GLX 绑定实现;实际帧循环完整使用上游 `FrameDriver`/`FrameProducer`/`FrameScheduler` 架构
   - 上游 AWT frame-driving extraction 同步(voxzen.14):合并 `2756625dc`,采用 #1273 的 `Renderer`/`FrameDriver` 架构并删除 #1285 已废弃的 `stubs.cc`;将 Voxzen 的 Linux GLX Visual、多窗口并行 vsync、Windows 同步缩放、macOS 高频缩放帧合并、Swing frame pacing 与 mediamp 兼容补丁迁移到新结构
   - Linux mediamp GLX 字段兼容(voxzen.15):在兼容 `LinuxOpenGLRedrawer` 上直接声明并初始化 native `context` 字段,满足 mediamp 0.3.0 使用 `getDeclaredField("context")` 的精确反射契约;父类 `LinuxOpenGLRenderer` 仍持有实际上下文并负责完整生命周期
+  - Windows Direct3D 快速缩放无残影(voxzen.16):透明 DirectComposition 交换链在每个同步 resize frame 的 `Present` 后等待 frame-latency object,确认 DXGI 已消费当前帧后再以 `DwmFlush` 提交窗口边界;实时缩放期间对子 HWND 使用 `SWP_NOCOPYBITS | SWP_NOREDRAW`,并从 `WM_NCCALCSIZE` 返回 `WVR_REDRAW`,禁止 Win32/AWT 把旧客户区像素复制到新尺寸或插入中间背景擦除,消除快速放大边缘白线与缩放残影
 
 ### CMP 兼容性
 

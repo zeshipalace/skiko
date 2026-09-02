@@ -45,6 +45,7 @@ public:
     gr_cp<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
+    HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
 
@@ -53,6 +54,10 @@ public:
         if (fenceEvent != NULL)
         {
             CloseHandle(fenceEvent);
+        }
+        if (frameLatencyWaitableObject != NULL)
+        {
+            CloseHandle(frameLatencyWaitableObject);
         }
         for (int i = 0; i < BuffersCount; i++)
         {
@@ -106,10 +111,10 @@ public:
         if (SUCCEEDED(result)) {
             swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
         }
-        if (swapChain.get() != nullptr && swapChainFlags != 0) {
+        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
             // A waitable swap chain has its own latency limit. Keep no more than the current frame queued so a burst
             // of resize messages cannot leave DirectComposition several frames behind the Win32 window geometry.
-            swapChain->SetMaximumFrameLatency(1);
+            frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
         }
         swapChainFactory4.reset(nullptr);
     }
@@ -283,7 +288,8 @@ static bool clientAreaFillsWindow(HWND hWnd) {
 static void applyEnforcedChildSize(LiveResizeState *s) {
     if (!s->contentHwnd) return;
     SetWindowPos(s->contentHwnd, nullptr, 0, 0, s->enforcedChildSize.cx, s->enforcedChildSize.cy,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                 SWP_NOCOPYBITS | SWP_NOREDRAW);
 }
 
 // DXGI clips the presented buffer to the child, so the child's size AT THE PRESENT bounds what reaches the screen.
@@ -297,6 +303,11 @@ static LRESULT CALLBACK LiveResizeContentWndProc(HWND hWnd, UINT msg, WPARAM wPa
         {
             p->cx = static_cast<int>(s->enforcedChildSize.cx);
             p->cy = static_cast<int>(s->enforcedChildSize.cy);
+            // The child is backed exclusively by a flip-model DirectComposition swap chain. Preserving its old GDI
+            // client bits or asking AWT to repaint between ResizeBuffers and Present can briefly expose a copied old
+            // edge (ghosting) or the window background (a white seam). The synchronous Direct3D frame below replaces
+            // the complete client area, so suppress both legacy paths for the duration of the resize step.
+            p->flags |= SWP_NOCOPYBITS | SWP_NOREDRAW;
         }
     }
     const LRESULT result = forwardToOriginal(s->originalContentProc, hWnd, msg, wParam, lParam);
@@ -335,6 +346,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             LRESULT r = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
             // isPumpingEdt(): our own render re-enters here, because the EDT's SetWindowPos is SENT back to this
             // thread. Starting a second round-trip would deadlock against the EDT already blocked in SendMessage.
+            bool renderedResizeFrame = false;
             if (s->inSizeMoveLoop && wParam && !isPumpingEdt())
             {
                 if (!s->liveResizeEngaged)
@@ -352,8 +364,11 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 s->lastFrameClientSize = pendingSize;
                 applyEnforcedChildSize(s);
                 javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ true);
+                renderedResizeFrame = true;
             }
-            return r;
+            // WM_NCCALCSIZE otherwise preserves/copies the old client image into the resized window. We have already
+            // presented a complete frame for the proposed size, so invalidate the legacy saved-bits path instead.
+            return renderedResizeFrame ? WVR_REDRAW : r;
         }
         case WM_PAINT:
             // Drives frames while the drag is paused and no WM_NCCALCSIZE fires. It has to be WM_PAINT: a
@@ -693,12 +708,16 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Called after Present and before WM_NCCALCSIZE returns, so the matching surface update reaches a DWM boundary
-    // before the new window geometry commits. The swap chain's one-frame latency limit prevents older presents from
-    // accumulating without adding another blocking composition transaction to every resize step.
+    // Called after Present and before WM_NCCALCSIZE returns. DwmFlush alone can complete while a composition swap
+    // chain still has the just-presented buffer queued. Waiting for the frame-latency object first ensures DXGI has
+    // consumed that Present; the following DWM boundary then commits the matching window geometry and surface frame.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
-        JNIEnv *env, jobject renderer)
+        JNIEnv *env, jobject renderer, jlong devicePtr)
     {
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (d3dDevice && d3dDevice->frameLatencyWaitableObject != NULL) {
+            WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 100, FALSE);
+        }
         DwmFlush();
     }
 

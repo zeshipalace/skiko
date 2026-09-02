@@ -106,7 +106,7 @@ internal class Direct3DRenderer(
             drawFrame()
             swap(withVsync)
             if (waitForComposition) {
-                waitForComposition()
+                waitForComposition(device)
             }
         }
     }
@@ -322,7 +322,7 @@ internal class Direct3DRenderer(
     private external fun installLiveResizeHook(window: Long, content: Long): Long
     private external fun uninstallLiveResizeHook(handle: Long)
     private external fun postLiveResizeRender(handle: Long)
-    private external fun waitForComposition()
+    private external fun waitForComposition(device: Long)
 
     private external fun flush(context: Long, surface: Long)
 }

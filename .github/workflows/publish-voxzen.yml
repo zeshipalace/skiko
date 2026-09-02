@@ -20,12 +20,13 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'Artifacts to publish (use windows first for native iteration, then portable after validation)'
+        description: 'Artifacts to build or publish (use windows-dry-run for native validation before publishing)'
         required: true
         default: all
         type: choice
         options:
           - all
+          - windows-dry-run
           - windows
           - portable
 
@@ -35,7 +36,7 @@ permissions:
 
 jobs:
   publish-linux:
-    if: inputs.scope != 'windows'
+    if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish (Linux x64 + shared artifacts)'
     runs-on: ubuntu-24.04
     steps:
@@ -67,7 +68,7 @@ jobs:
               publishToVoxzenGitHubPackages
 
   publish-linux-arm64:
-    if: inputs.scope != 'windows'
+    if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish Linux arm64 runtime'
     runs-on: ubuntu-24.04-arm
     steps:
@@ -119,6 +120,7 @@ jobs:
       # 只发布 Windows 独有的 runtime;skiko-awt 等公共产物由 publish-linux 发布
       - shell: bash
         name: 'Publish Windows x64 runtime to GitHub Packages'
+        if: inputs.scope != 'windows-dry-run'
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,9 +129,30 @@ jobs:
             -Pdeploy.release=true \
             publishSkikoJvmRuntimeWindowsX64PublicationToVoxzenGitHubPackagesRepository
 
+      # 本地没有 MSVC 时的原生迭代通道：只构建 Maven Local 产物并上传，不写入 GitHub Packages。
+      - shell: bash
+        name: 'Build Windows x64 validation package'
+        if: inputs.scope == 'windows-dry-run'
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.native.enabled=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.arch=x64 \
+            publishToMavenLocal
+
+      - uses: actions/upload-artifact@v4
+        name: 'Upload Windows x64 validation package'
+        if: inputs.scope == 'windows-dry-run'
+        with:
+          name: skiko-windows-x64-maven-local
+          path: ~/.m2/repository/org/jetbrains/skiko
+          retention-days: 2
+
       # arm64 需要单独的 gradle 调用(skiko.arch 是全局属性),MSVC 交叉编译
       - shell: bash
         name: 'Publish Windows arm64 runtime to GitHub Packages'
+        if: inputs.scope != 'windows-dry-run'
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -141,7 +164,7 @@ jobs:
             publishSkikoJvmRuntimeWindowsArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-macos:
-    if: inputs.scope != 'windows'
+    if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish macOS runtimes'
     runs-on: macos-15
     steps:
