@@ -748,16 +748,18 @@ extern "C"
         }
     }
 
-    // Called after Present and before the pending HWND geometry is committed. ResizeBuffers changes the composition
-    // swap chain independently of the DirectComposition visual tree, so submit a composition transaction and wait
-    // until the compositor has processed it before allowing the outer window to expose its new client area.
+    // Called after Present and before the pending HWND geometry is committed. The DirectComposition visual has no
+    // property changes to commit here; what must finish is the D3D12 work that produced this swap-chain buffer. Once
+    // its queue fence completes, a DWM boundary can pick up the fully rendered frame instead of the preceding buffer.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (d3dDevice && d3dDevice->dcDevice.get() != nullptr) {
-            if (SUCCEEDED(d3dDevice->dcDevice->Commit())) {
-                d3dDevice->dcDevice->WaitForCommitCompletion();
+        if (d3dDevice && d3dDevice->fence.get() != nullptr) {
+            const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
+            if (d3dDevice->fence->GetCompletedValue() < fenceValue) {
+                d3dDevice->fence->SetEventOnCompletion(fenceValue, d3dDevice->fenceEvent);
+                WaitForSingleObjectEx(d3dDevice->fenceEvent, INFINITE, FALSE);
             }
         }
         DwmFlush();
