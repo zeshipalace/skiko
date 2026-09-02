@@ -34,6 +34,10 @@ internal class FrameDriver(
         override fun onLiveResizeStarted() {
             isPlatformDrivingFrames = true
             scheduler.pause()
+            // A scheduled frame dispatched into the pause is dropped without rendering; the invalidation it
+            // carried never re-arms, freezing animations until the loop exits. Kick one platform-driven frame
+            // so the invalidate -> render -> invalidate chain starts regardless of the transition race.
+            renderer.requestPlatformDrivenFrame()
         }
 
         override fun onLiveResizeFrame(width: Int, height: Int, isResizeFrame: Boolean) {

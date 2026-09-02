@@ -182,8 +182,14 @@ struct LiveResizeState {
     SIZE enforcedChildSize = {};    // what the child is held at during a drag; see enforcedChildSizeForResizeStep
     SIZE preRenderedFrameSize = {}; // full-client frame rendered from WM_WINDOWPOSCHANGING, before geometry changes
     bool hasPreparedFrame = false;  // rendered into the back buffer, but presented only after HWND geometry commits
+    bool currentWindowPosResized = false; // current WM_WINDOWPOSCHANGING step changes the window size
     bool inSizeMoveLoop = false;    // WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE, which covers plain moves too
-    bool liveResizeEngaged = false; // ...whereas this means an actual resize
+    bool liveResizeEngaged = false; // platform-driven frames active (engaged at loop entry, incl. plain moves)
+    bool engageOnMove = false;      // engage at WM_ENTERSIZEMOVE, or only at the first actual resize step
+    SIZE appliedChildSize = {};     // last child size observed on the content HWND; see applyEnforcedChildSize
+    bool hasAppliedChildSize = false;
+    LONGLONG lastMoveFrameQpc = 0;  // QPC timestamp used to throttle position-message frames
+    LONGLONG moveFrameIntervalQpc = 0;
     bool detached = false;          // uninstalled, but a proc we couldn't remove still needs us to forward; see below
 };
 
@@ -289,9 +295,17 @@ static bool clientAreaFillsWindow(HWND hWnd) {
 
 static void applyEnforcedChildSize(LiveResizeState *s) {
     if (!s->contentHwnd) return;
+    // appliedChildSize tracks the content HWND's real size (kept current by its WM_WINDOWPOSCHANGED), so this
+    // only sends a SetWindowPos when the child actually diverged - e.g. Swing's async doLayout landing mid-hold -
+    // and not once per WM_PAINT frame of a plain move.
+    if (s->hasAppliedChildSize &&
+        s->appliedChildSize.cx == s->enforcedChildSize.cx &&
+        s->appliedChildSize.cy == s->enforcedChildSize.cy) return;
     SetWindowPos(s->contentHwnd, nullptr, 0, 0, s->enforcedChildSize.cx, s->enforcedChildSize.cy,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
                  SWP_NOCOPYBITS | SWP_NOREDRAW);
+    s->appliedChildSize = s->enforcedChildSize;
+    s->hasAppliedChildSize = true;
 }
 
 static void javaPresentPreparedLiveResizeFrame(LiveResizeState *s) {
@@ -306,6 +320,10 @@ static void javaPresentPreparedLiveResizeFrame(LiveResizeState *s) {
     }
     if (mid) env->CallVoidMethod(s->renderer, mid);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void driveMoveFrame(LiveResizeState *s) {
+    javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ false);
 }
 
 static void renderPendingResizeFrame(LiveResizeState *s, SIZE pendingSize) {
@@ -344,9 +362,18 @@ static LRESULT CALLBACK LiveResizeContentWndProc(HWND hWnd, UINT msg, WPARAM wPa
         }
     }
     const LRESULT result = forwardToOriginal(s->originalContentProc, hWnd, msg, wParam, lParam);
-    if (msg == WM_WINDOWPOSCHANGED && s->liveResizeEngaged) {
-        // AWT can leave a stale child region during live resize, causing visual artifacts.
-        SetWindowRgn(hWnd, nullptr, FALSE);
+    if (msg == WM_WINDOWPOSCHANGED) {
+        // Track the child's real size so applyEnforcedChildSize can tell our own no-op repeats from a genuine
+        // divergence (e.g. Swing's async doLayout landing mid-resize) that must be re-asserted.
+        WINDOWPOS *wp = (WINDOWPOS *)lParam;
+        if (wp && !(wp->flags & SWP_NOSIZE)) {
+            s->appliedChildSize = { wp->cx, wp->cy };
+            s->hasAppliedChildSize = true;
+        }
+        if (s->liveResizeEngaged) {
+            // AWT can leave a stale child region during live resize, causing visual artifacts.
+            SetWindowRgn(hWnd, nullptr, FALSE);
+        }
     }
     return result;
 }
@@ -364,20 +391,36 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->liveResizeEngaged = false;
             s->preRenderedFrameSize = {};
             s->hasPreparedFrame = false;
+            s->currentWindowPosResized = false;
+            s->hasAppliedChildSize = false;
+            LARGE_INTEGER qpcFrequency;
+            QueryPerformanceFrequency(&qpcFrequency);
+            s->lastMoveFrameQpc = 0;
+            s->moveFrameIntervalQpc = std::max<LONGLONG>(1, qpcFrequency.QuadPart * 8 / 1000);
             RECT rc; GetClientRect(hWnd, &rc);
             const SIZE clientSize = { rc.right - rc.left, rc.bottom - rc.top };
             s->enforcedChildSize = enforcedChildSizeForResizeStep(clientSize, clientSize);
             s->lastFrameClientSize = clientSize;
+            // A plain title-bar drag never changes the client size, so it never reaches renderPendingResizeFrame -
+            // the old sole engagement point - and its frames stayed on the EDT scheduler, which the modal move
+            // loop starves with input-rate position messages. Engage at loop entry instead: the scheduler pauses
+            // and position changes pull move frames while coalesced WM_PAINT covers resize holds.
+            if (s->engageOnMove) {
+                s->liveResizeEngaged = true;
+                javaOnLiveResizeStarted(s);
+            }
             break;
         }
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
+            const bool resized = windowPos && !(windowPos->flags & SWP_NOSIZE);
+            s->currentWindowPosResized = resized;
             // For custom-decorated windows whose client fills the frame, WINDOWPOS already carries the exact next
             // client size and arrives before WM_NCCALCSIZE. Render here while GetWindowRect and DWM still expose the
             // committed geometry; otherwise a screen sampler (and, on a fast drag, the user) can observe the new
             // outer edge during the few milliseconds spent laying out and presenting from WM_NCCALCSIZE.
             if (
-                s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
+                s->inSizeMoveLoop && resized &&
                 windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
                 clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
@@ -392,7 +435,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
             // The original procedure may constrain WINDOWPOS. Render its adjusted size before returning as well.
             if (
-                s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
+                s->inSizeMoveLoop && resized &&
                 windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
                 clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
@@ -410,6 +453,21 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
             const bool resized = windowPos && !(windowPos->flags & SWP_NOSIZE);
             const LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
+            if (s->inSizeMoveLoop && s->liveResizeEngaged && !resized && !isPumpingEdt()) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                const bool frameDue =
+                    s->lastMoveFrameQpc == 0 || now.QuadPart - s->lastMoveFrameQpc >= s->moveFrameIntervalQpc;
+                if (frameDue) {
+                    s->lastMoveFrameQpc = now.QuadPart;
+                    if (s->hasPreparedFrame) {
+                        javaPresentPreparedLiveResizeFrame(s);
+                        s->hasPreparedFrame = false;
+                    }
+                    applyEnforcedChildSize(s);
+                    driveMoveFrame(s);
+                }
+            }
             if (s->inSizeMoveLoop && s->liveResizeEngaged && resized && !isPumpingEdt()) {
                 // WM_WINDOWPOSCHANGED is sent only after the new HWND geometry has been applied. Finish any adjusted
                 // layout now, resize the child to that exact committed client, then Present the back buffer prepared
@@ -446,17 +504,30 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // isPumpingEdt(): our own render re-enters here, because the EDT's SetWindowPos is SENT back to this
             // thread. Starting a second round-trip would deadlock against the EDT already blocked in SendMessage.
             bool renderedResizeFrame = false;
-            if (s->inSizeMoveLoop && wParam && IsWindowVisible(hWnd) && !isPumpingEdt())
+            if (
+                s->inSizeMoveLoop && s->currentWindowPosResized && wParam &&
+                IsWindowVisible(hWnd) && !isPumpingEdt()
+            )
             {
                 RECT c = fullWindowClient ? proposedFrameRect : p->rgrc[0];
                 const SIZE pendingSize = { c.right - c.left, c.bottom - c.top };
+                RECT committed = {};
+                GetClientRect(hWnd, &committed);
+                const SIZE committedSize = {
+                    committed.right - committed.left,
+                    committed.bottom - committed.top
+                };
+                const bool sizeChanged =
+                    pendingSize.cx != committedSize.cx || pendingSize.cy != committedSize.cy;
                 const bool alreadyRendered =
                     s->preRenderedFrameSize.cx == pendingSize.cx && s->preRenderedFrameSize.cy == pendingSize.cy;
-                if (!alreadyRendered) {
+                if (sizeChanged && !alreadyRendered) {
                     renderPendingResizeFrame(s, pendingSize);
                 }
-                s->preRenderedFrameSize = {};
-                renderedResizeFrame = true;
+                if (sizeChanged) {
+                    s->preRenderedFrameSize = {};
+                    renderedResizeFrame = true;
+                }
             }
             // WM_NCCALCSIZE otherwise preserves/copies the old client image into the resized window. We have already
             // presented a complete frame for the proposed size, so invalidate the legacy saved-bits path instead.
@@ -475,7 +546,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 if (s->hasPreparedFrame) return 0;
                 // A hold is where Swing's async doLayout lands, so the size has to be re-asserted here too.
                 applyEnforcedChildSize(s);
-                javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ false);
+                driveMoveFrame(s);
                 return 0;
             }
             break;
@@ -511,6 +582,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->liveResizeEngaged = false;
             s->preRenderedFrameSize = {};
             s->hasPreparedFrame = false;
+            s->currentWindowPosResized = false;
             break;
     }
     return forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
@@ -960,7 +1032,7 @@ extern "C"
 
     // Returns the state as an opaque handle (0 on failure) for the two calls below.
     JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_installLiveResizeHook(
-        JNIEnv *env, jobject renderer, jlong windowPtr, jlong contentPtr)
+        JNIEnv *env, jobject renderer, jlong windowPtr, jlong contentPtr, jboolean engageOnMove)
     {
         HWND top = GetAncestor(fromJavaPointer<HWND>(windowPtr), GA_ROOT);
         if (!top) return 0;
@@ -970,6 +1042,7 @@ extern "C"
         state->frameHwnd = top;
         state->contentHwnd = fromJavaPointer<HWND>(contentPtr);
         state->renderer = env->NewGlobalRef(renderer);
+        state->engageOnMove = engageOnMove == JNI_TRUE;
         state->originalProc = installWndProcHook(top, state, LiveResizeWndProc);
         state->originalContentProc = installWndProcHook(state->contentHwnd, state, LiveResizeContentWndProc);
         return toJavaPointer(state);

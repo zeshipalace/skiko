@@ -65,7 +65,11 @@ internal class Direct3DRenderer(
             .takeIf { it != 0L } ?: throw RenderException("Failed to create DirectX12 device.")
 
         if (synchronousLiveResizeRequested) {
-            liveResizeHandle = installLiveResizeHook(layer.windowHandle, layer.contentHandle)
+            liveResizeHandle = installLiveResizeHook(
+                layer.windowHandle,
+                layer.contentHandle,
+                SkikoProperties.direct3DSynchronousLiveMove
+            )
         }
     }
 
@@ -378,7 +382,11 @@ internal class Direct3DRenderer(
     private external fun getAdapterName(adapter: Long): String
     private external fun getAdapterMemorySize(adapter: Long): Long
 
-    private external fun installLiveResizeHook(window: Long, content: Long): Long
+    private external fun installLiveResizeHook(
+        window: Long,
+        content: Long,
+        engageOnMove: Boolean
+    ): Long
     private external fun uninstallLiveResizeHook(handle: Long)
     private external fun postLiveResizeRender(handle: Long)
     private external fun waitForNextFrame(device: Long)

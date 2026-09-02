@@ -155,6 +155,17 @@ object SkikoProperties {
         by lazyBooleanProperty("skiko.rendering.windows.direct3DSynchronousLiveResize", defaultValue = false)
 
     /**
+     * Direct3D on Windows: when [direct3DSynchronousLiveResize] is enabled, also engage the platform-driven
+     * frame path for the title-bar drag (a size/move modal loop that never changes the client size).
+     * Frames are then pulled by coalesced WM_PAINT instead of the EDT scheduler, which the modal move loop
+     * starves with input-rate position messages.
+     *
+     * Disable to fall back to engaging only once an actual resize step is seen.
+     */
+    val direct3DSynchronousLiveMove: Boolean
+        by lazyBooleanProperty("skiko.rendering.windows.direct3DSynchronousLiveMove", defaultValue = true)
+
+    /**
      * Is experimental ANGLE renderer API enabled (https://skia.org/docs/user/special/angle/).
      *
      * If enabled, Windows uses it as a primary render API and fallbacks to the default APIs.
