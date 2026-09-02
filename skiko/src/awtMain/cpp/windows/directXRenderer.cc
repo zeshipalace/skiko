@@ -48,7 +48,6 @@ public:
     HANDLE frameLatencyWaitableObject = NULL;
     UINT swapChainFlags = 0;
     unsigned int bufferIndex;
-    UINT lastSubmittedPresentCount = 0;
 
     ~DirectXDevice()
     {
@@ -352,26 +351,6 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             const SIZE clientSize = { rc.right - rc.left, rc.bottom - rc.top };
             s->enforcedChildSize = enforcedChildSizeForResizeStep(clientSize, clientSize);
             s->lastFrameClientSize = clientSize;
-            break;
-        }
-        case WM_SIZING: {
-            // WM_SIZING precedes SetWindowPos and carries the dragged outer rectangle. Full-client custom windows
-            // map that rectangle directly to their next client size, so rendering here gives DirectComposition a
-            // complete frame one message earlier than WM_WINDOWPOSCHANGING can. The latter remains as a fallback for
-            // programmatic resizes and for lower window procedures that adjust this proposed rectangle.
-            RECT *proposedRect = (RECT *)lParam;
-            if (s->inSizeMoveLoop && proposedRect && clientAreaFillsWindow(hWnd) && !isPumpingEdt()) {
-                const SIZE pendingSize = {
-                    proposedRect->right - proposedRect->left,
-                    proposedRect->bottom - proposedRect->top
-                };
-                const bool alreadyRendered =
-                    s->preRenderedFrameSize.cx == pendingSize.cx && s->preRenderedFrameSize.cy == pendingSize.cy;
-                if (pendingSize.cx > 0 && pendingSize.cy > 0 && !alreadyRendered) {
-                    renderPendingResizeFrame(s, pendingSize);
-                    s->preRenderedFrameSize = pendingSize;
-                }
-            }
             break;
         }
         case WM_WINDOWPOSCHANGING: {
@@ -788,9 +767,9 @@ extern "C"
 
     // Called after Present and before the pending HWND geometry is committed. The DirectComposition visual has no
     // property changes to commit here; what must finish is the D3D12 work that produced this swap-chain buffer. Once
-    // its queue fence completes, wait until flip-model presentation statistics confirm that DWM displayed this exact
-    // Present. GetFrameStatistics can initially be disjoint and can lag behind hardware flip queues, so DwmFlush also
-    // advances/reconciles the statistics; the deadline keeps unsupported multi-monitor/driver cases from hanging.
+    // its queue fence completes, return immediately so WM_WINDOWPOS can commit the matching HWND geometry. Waiting
+    // for DWM to display here would expose this future-sized frame inside the still-committed smaller window; queuing
+    // both changes before the next compositor tick lets DWM observe the new pixels and geometry together.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
@@ -802,17 +781,6 @@ extern "C"
                 WaitForSingleObjectEx(d3dDevice->fenceEvent, INFINITE, FALSE);
             }
         }
-        const UINT targetPresentCount = d3dDevice ? d3dDevice->lastSubmittedPresentCount : 0;
-        const ULONGLONG deadline = GetTickCount64() + 100;
-        do {
-            DwmFlush();
-            if (!d3dDevice || !d3dDevice->swapChain.get() || targetPresentCount == 0) break;
-            DXGI_FRAME_STATISTICS statistics = {};
-            if (SUCCEEDED(d3dDevice->swapChain->GetFrameStatistics(&statistics)) &&
-                static_cast<INT>(statistics.PresentCount - targetPresentCount) >= 0) {
-                break;
-            }
-        } while (GetTickCount64() < deadline);
     }
 
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.
@@ -859,10 +827,7 @@ extern "C"
             DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
             // 1 value in [Present(1, 0)] enables vblank wait so this is how vertical sync works in DirectX.
             const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
-            const HRESULT presentResult = d3dDevice->swapChain->Present((int)isVsyncEnabled, 0);
-            if (SUCCEEDED(presentResult)) {
-                d3dDevice->swapChain->GetLastPresentCount(&d3dDevice->lastSubmittedPresentCount);
-            }
+            d3dDevice->swapChain->Present((int)isVsyncEnabled, 0);
             d3dDevice->queue->Signal(d3dDevice->fence.get(), fenceValue);
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
