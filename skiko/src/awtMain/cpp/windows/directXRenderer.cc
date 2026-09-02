@@ -468,6 +468,9 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // invalidating the frame.
             if (s->inSizeMoveLoop && s->liveResizeEngaged && !isPumpingEdt()) {
                 ValidateRect(hWnd, nullptr); // before rendering, so the re-arm below isn't cleared
+                // A resize frame is intentionally left in the back buffer until WM_WINDOWPOSCHANGED. Do not let a
+                // nested/early paint advance the swap chain between preparation and that matching geometry commit.
+                if (s->hasPreparedFrame) return 0;
                 // A hold is where Swing's async doLayout lands, so the size has to be re-asserted here too.
                 applyEnforcedChildSize(s);
                 javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ false);
@@ -475,9 +478,18 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             }
             break;
         case WM_EXITSIZEMOVE:
+            if (s->liveResizeEngaged && s->hasPreparedFrame) {
+                // Never abandon a prepared back buffer: the next getBufferIndex would wait for a fence value whose
+                // Signal is issued by Present, deadlocking against the window thread that was meant to perform it.
+                RECT rc = {};
+                GetClientRect(hWnd, &rc);
+                s->enforcedChildSize = { rc.right - rc.left, rc.bottom - rc.top };
+                applyEnforcedChildSize(s);
+                javaPresentPreparedLiveResizeFrame(s);
+                s->hasPreparedFrame = false;
+            }
             s->inSizeMoveLoop = false;
             s->preRenderedFrameSize = {};
-            s->hasPreparedFrame = false;
             if (s->liveResizeEngaged) {
                 s->liveResizeEngaged = false;
                 // Ensure the client size is correct when exiting live resize mode

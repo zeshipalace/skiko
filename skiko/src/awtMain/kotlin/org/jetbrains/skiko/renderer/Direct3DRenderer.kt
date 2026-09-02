@@ -104,6 +104,10 @@ internal class Direct3DRenderer(
             if (isDisposed) {
                 return
             }
+            // A final resize proposal can be prepared immediately before WM_EXITSIZEMOVE. It must be submitted
+            // before a regular EDT frame asks DXGI for the next back buffer, otherwise that call waits for a fence
+            // which is signalled only by the skipped Present.
+            presentPreparedLiveResizeFrameLocked()
             // A frame-latency waitable swap chain must be waited before rendering every frame, including its first
             // frame. Waiting after Present can consume the initially-signalled state without pacing that Present,
             // which lets the window geometry briefly outrun the first live-resize frame.
@@ -328,11 +332,16 @@ internal class Direct3DRenderer(
     @Suppress("unused")
     private fun presentPreparedLiveResizeFrame() {
         synchronized(drawLock) {
-            if (isDisposed || !hasPreparedLiveResizeFrame) return
-            swap(withVsync = false)
-            waitForComposition(device)
-            hasPreparedLiveResizeFrame = false
+            if (isDisposed) return
+            presentPreparedLiveResizeFrameLocked()
         }
+    }
+
+    private fun presentPreparedLiveResizeFrameLocked() {
+        if (!hasPreparedLiveResizeFrame) return
+        swap(withVsync = false)
+        waitForComposition(device)
+        hasPreparedLiveResizeFrame = false
     }
 
     private external fun chooseAdapter(adapterPriority: Int): Long
