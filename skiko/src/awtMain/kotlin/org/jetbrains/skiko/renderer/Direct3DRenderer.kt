@@ -103,6 +103,12 @@ internal class Direct3DRenderer(
             if (isDisposed) {
                 return
             }
+            // A frame-latency waitable swap chain must be waited before rendering every frame, including its first
+            // frame. Waiting after Present can consume the initially-signalled state without pacing that Present,
+            // which lets the window geometry briefly outrun the first live-resize frame.
+            if (liveResizeInstalled && isSwapChainInitialized) {
+                waitForNextFrame(device)
+            }
             drawFrame()
             swap(withVsync)
             if (waitForComposition) {
@@ -322,6 +328,7 @@ internal class Direct3DRenderer(
     private external fun installLiveResizeHook(window: Long, content: Long): Long
     private external fun uninstallLiveResizeHook(handle: Long)
     private external fun postLiveResizeRender(handle: Long)
+    private external fun waitForNextFrame(device: Long)
     private external fun waitForComposition(device: Long)
 
     private external fun flush(context: Long, surface: Long)

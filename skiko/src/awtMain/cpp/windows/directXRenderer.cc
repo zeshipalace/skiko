@@ -737,15 +737,28 @@ extern "C"
         return toJavaPointer(result);
     }
 
-    // Called after Present and before WM_NCCALCSIZE returns. DwmFlush alone can complete while a composition swap
-    // chain still has the just-presented buffer queued. Waiting for the frame-latency object first ensures DXGI has
-    // consumed that Present; the following DWM boundary then commits the matching window geometry and surface frame.
-    JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
+    // A frame-latency waitable swap chain has to be waited before rendering every frame, including the first one.
+    // This drains the preceding presentation before Skia starts modifying the next back buffer.
+    JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForNextFrame(
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
         if (d3dDevice && d3dDevice->frameLatencyWaitableObject != NULL) {
             WaitForSingleObjectEx(d3dDevice->frameLatencyWaitableObject, 100, FALSE);
+        }
+    }
+
+    // Called after Present and before the pending HWND geometry is committed. ResizeBuffers changes the composition
+    // swap chain independently of the DirectComposition visual tree, so submit a composition transaction and wait
+    // until the compositor has processed it before allowing the outer window to expose its new client area.
+    JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
+        JNIEnv *env, jobject renderer, jlong devicePtr)
+    {
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (d3dDevice && d3dDevice->dcDevice.get() != nullptr) {
+            if (SUCCEEDED(d3dDevice->dcDevice->Commit())) {
+                d3dDevice->dcDevice->WaitForCommitCompletion();
+            }
         }
         DwmFlush();
     }
