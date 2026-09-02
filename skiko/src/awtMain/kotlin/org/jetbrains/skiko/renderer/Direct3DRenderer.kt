@@ -67,6 +67,7 @@ internal class Direct3DRenderer(
     private var canvas: Canvas? = null
     private var currentWidth = 0
     private var currentHeight = 0
+    private var hasPreparedLiveResizeFrame = false
     private fun isSurfacesNull() = surfaces.all { it == null }
 
     init {
@@ -306,10 +307,32 @@ internal class Direct3DRenderer(
 
     override fun LayerDrawScope.renderPlatformDrivenFrame(isResizeFrame: Boolean) {
         if (isDisposed) return // may be disposed in user code, during `update`
-        drawAndSwap(
-            withVsync = !isResizeFrame,
-            waitForComposition = isResizeFrame
-        )
+        if (isResizeFrame) {
+            synchronized(drawLock) {
+                if (isDisposed) return
+                // Prepare the exact-size buffer while Win32 still exposes the preceding geometry. Native code calls
+                // presentPreparedLiveResizeFrame only from WM_WINDOWPOSCHANGED, after these pixels and the HWND bounds
+                // describe the same resize step.
+                if (liveResizeInstalled && isSwapChainInitialized) {
+                    waitForNextFrame(device)
+                }
+                drawFrame()
+                hasPreparedLiveResizeFrame = true
+            }
+        } else {
+            drawAndSwap(withVsync = true)
+        }
+    }
+
+    /** Called from native WM_WINDOWPOSCHANGED after the prepared frame's geometry has committed. */
+    @Suppress("unused")
+    private fun presentPreparedLiveResizeFrame() {
+        synchronized(drawLock) {
+            if (isDisposed || !hasPreparedLiveResizeFrame) return
+            swap(withVsync = false)
+            waitForComposition(device)
+            hasPreparedLiveResizeFrame = false
+        }
     }
 
     private external fun chooseAdapter(adapterPriority: Int): Long

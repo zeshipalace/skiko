@@ -181,6 +181,7 @@ struct LiveResizeState {
     SIZE lastFrameClientSize = {};
     SIZE enforcedChildSize = {};    // what the child is held at during a drag; see enforcedChildSizeForResizeStep
     SIZE preRenderedFrameSize = {}; // full-client frame rendered from WM_WINDOWPOSCHANGING, before geometry changes
+    bool hasPreparedFrame = false;  // rendered into the back buffer, but presented only after HWND geometry commits
     bool inSizeMoveLoop = false;    // WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE, which covers plain moves too
     bool liveResizeEngaged = false; // ...whereas this means an actual resize
     bool detached = false;          // uninstalled, but a proc we couldn't remove still needs us to forward; see below
@@ -293,6 +294,20 @@ static void applyEnforcedChildSize(LiveResizeState *s) {
                  SWP_NOCOPYBITS | SWP_NOREDRAW);
 }
 
+static void javaPresentPreparedLiveResizeFrame(LiveResizeState *s) {
+    if (!s->renderer) return;
+    JNIEnv *env = getJniEnv();
+    if (!env) return;
+    static jmethodID mid = nullptr;
+    if (!mid) {
+        jclass cls = env->GetObjectClass(s->renderer);
+        mid = env->GetMethodID(cls, "presentPreparedLiveResizeFrame", "()V");
+        env->DeleteLocalRef(cls);
+    }
+    if (mid) env->CallVoidMethod(s->renderer, mid);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
 static void renderPendingResizeFrame(LiveResizeState *s, SIZE pendingSize) {
     if (!s->liveResizeEngaged)
     {
@@ -307,6 +322,7 @@ static void renderPendingResizeFrame(LiveResizeState *s, SIZE pendingSize) {
     s->lastFrameClientSize = pendingSize;
     applyEnforcedChildSize(s);
     javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ true);
+    s->hasPreparedFrame = true;
 }
 
 // DXGI clips the presented buffer to the child, so the child's size AT THE PRESENT bounds what reaches the screen.
@@ -347,6 +363,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->inSizeMoveLoop = true;
             s->liveResizeEngaged = false;
             s->preRenderedFrameSize = {};
+            s->hasPreparedFrame = false;
             RECT rc; GetClientRect(hWnd, &rc);
             const SIZE clientSize = { rc.right - rc.left, rc.bottom - rc.top };
             s->enforcedChildSize = enforcedChildSizeForResizeStep(clientSize, clientSize);
@@ -383,6 +400,34 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 if (!alreadyRendered) {
                     renderPendingResizeFrame(s, adjustedSize);
                     s->preRenderedFrameSize = adjustedSize;
+                }
+            }
+            return result;
+        }
+        case WM_WINDOWPOSCHANGED: {
+            WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
+            const bool resized = windowPos && !(windowPos->flags & SWP_NOSIZE);
+            const LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
+            if (s->inSizeMoveLoop && s->liveResizeEngaged && resized && !isPumpingEdt()) {
+                // WM_WINDOWPOSCHANGED is sent only after the new HWND geometry has been applied. Finish any adjusted
+                // layout now, resize the child to that exact committed client, then Present the back buffer prepared
+                // by WM_WINDOWPOSCHANGING/WM_NCCALCSIZE. DWM can no longer pair future pixels with the old bounds, or
+                // expose the enlarged bounds while the matching Present is still merely queued.
+                RECT client = {};
+                GetClientRect(hWnd, &client);
+                const SIZE committedSize = { client.right - client.left, client.bottom - client.top };
+                if (
+                    committedSize.cx > 0 && committedSize.cy > 0 &&
+                    (s->lastFrameClientSize.cx != committedSize.cx ||
+                     s->lastFrameClientSize.cy != committedSize.cy)
+                ) {
+                    renderPendingResizeFrame(s, committedSize);
+                }
+                s->enforcedChildSize = committedSize;
+                applyEnforcedChildSize(s);
+                if (s->hasPreparedFrame) {
+                    javaPresentPreparedLiveResizeFrame(s);
+                    s->hasPreparedFrame = false;
                 }
             }
             return result;
@@ -432,6 +477,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         case WM_EXITSIZEMOVE:
             s->inSizeMoveLoop = false;
             s->preRenderedFrameSize = {};
+            s->hasPreparedFrame = false;
             if (s->liveResizeEngaged) {
                 s->liveResizeEngaged = false;
                 // Ensure the client size is correct when exiting live resize mode
@@ -765,11 +811,10 @@ extern "C"
         }
     }
 
-    // Called after Present and before the pending HWND geometry is committed. The DirectComposition visual has no
-    // property changes to commit here; what must finish is the D3D12 work that produced this swap-chain buffer. Once
-    // its queue fence completes, return immediately so WM_WINDOWPOS can commit the matching HWND geometry. Waiting
-    // for DWM to display here would expose this future-sized frame inside the still-committed smaller window; queuing
-    // both changes before the next compositor tick lets DWM observe the new pixels and geometry together.
+    // Called after Present from WM_WINDOWPOSCHANGED, when the matching HWND and child geometry is already committed.
+    // Wait for the D3D12 work that produced the buffer, then cross a DWM composition boundary before allowing the
+    // next resize step. Presenting any earlier shows future-sized pixels in old bounds; returning any earlier lets
+    // the enlarged bounds become visible while this Present is still queued.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_waitForComposition(
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
@@ -781,6 +826,7 @@ extern "C"
                 WaitForSingleObjectEx(d3dDevice->fenceEvent, INFINITE, FALSE);
             }
         }
+        DwmFlush();
     }
 
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.
