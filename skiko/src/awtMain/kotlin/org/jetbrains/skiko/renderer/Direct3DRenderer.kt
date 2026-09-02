@@ -20,6 +20,8 @@ internal class Direct3DRenderer(
 
     private var drawLock = Any()
     private var isSwapChainInitialized = false
+    private val synchronousLiveResizeRequested =
+        layer.fillsWindow && SkikoProperties.direct3DSynchronousLiveResize
 
     // Native LiveResizeState, 0 if the hook isn't installed.
     private var liveResizeHandle: Long = 0L
@@ -45,10 +47,24 @@ internal class Direct3DRenderer(
         adapterName = getAdapterName(adapter)
         adapterMemorySize = getAdapterMemorySize(adapter)
         onDeviceChosen(adapterName)
-        device = createDirectXDevice(adapter, layer.contentHandle, layer.transparency)
+        // A DirectComposition target bound to the AWT child HWND is clipped by that child's asynchronously updated
+        // visible region. During a fast grow this can expose the top-level Acrylic background at the right/bottom
+        // edge even though the swap-chain buffer already has the new size. A fill-window synchronous layer can bind
+        // its visual directly to the top-level HWND and avoid that independent child clipping boundary.
+        val compositionTargetHandle = if (layer.transparency && synchronousLiveResizeRequested) {
+            layer.windowHandle
+        } else {
+            layer.contentHandle
+        }
+        device = createDirectXDevice(
+            adapter,
+            layer.contentHandle,
+            compositionTargetHandle,
+            layer.transparency
+        )
             .takeIf { it != 0L } ?: throw RenderException("Failed to create DirectX12 device.")
 
-        if (layer.fillsWindow && SkikoProperties.direct3DSynchronousLiveResize) {
+        if (synchronousLiveResizeRequested) {
             liveResizeHandle = installLiveResizeHook(layer.windowHandle, layer.contentHandle)
         }
     }
@@ -345,7 +361,12 @@ internal class Direct3DRenderer(
     }
 
     private external fun chooseAdapter(adapterPriority: Int): Long
-    private external fun createDirectXDevice(adapter: Long, contentHandle: Long, transparency: Boolean): Long
+    private external fun createDirectXDevice(
+        adapter: Long,
+        contentHandle: Long,
+        compositionTargetHandle: Long,
+        transparency: Boolean
+    ): Long
     private external fun makeDirectXContext(device: Long): Long
     private external fun makeDirectXSurface(device: Long, context: Long, width: Int, height: Int, surfacePropsIntArray: InteropPointer, index: Int): Long
     private external fun resizeBuffers(device: Long, width: Int, height: Int)

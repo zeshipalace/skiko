@@ -378,7 +378,8 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // outer edge during the few milliseconds spent laying out and presenting from WM_NCCALCSIZE.
             if (
                 s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
-                windowPos->cx > 0 && windowPos->cy > 0 && clientAreaFillsWindow(hWnd) && !isPumpingEdt()
+                windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
+                clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
                 const SIZE pendingSize = { windowPos->cx, windowPos->cy };
                 const bool alreadyRendered =
@@ -392,7 +393,8 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // The original procedure may constrain WINDOWPOS. Render its adjusted size before returning as well.
             if (
                 s->inSizeMoveLoop && windowPos && !(windowPos->flags & SWP_NOSIZE) &&
-                windowPos->cx > 0 && windowPos->cy > 0 && clientAreaFillsWindow(hWnd) && !isPumpingEdt()
+                windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
+                clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
                 const SIZE adjustedSize = { windowPos->cx, windowPos->cy };
                 const bool alreadyRendered =
@@ -444,7 +446,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // isPumpingEdt(): our own render re-enters here, because the EDT's SetWindowPos is SENT back to this
             // thread. Starting a second round-trip would deadlock against the EDT already blocked in SendMessage.
             bool renderedResizeFrame = false;
-            if (s->inSizeMoveLoop && wParam && !isPumpingEdt())
+            if (s->inSizeMoveLoop && wParam && IsWindowVisible(hWnd) && !isPumpingEdt())
             {
                 RECT c = fullWindowClient ? proposedFrameRect : p->rgrc[0];
                 const SIZE pendingSize = { c.right - c.left, c.bottom - c.top };
@@ -500,6 +502,15 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
                 }
                 javaOnLiveResizeEnded(s);
             }
+            break;
+        case WM_DESTROY:
+        case WM_NCDESTROY:
+            // A test failure or application close can tear the window down before the modal sizing loop emits its
+            // normal exit message. Do not start further EDT round-trips from teardown geometry messages.
+            s->inSizeMoveLoop = false;
+            s->liveResizeEngaged = false;
+            s->preRenderedFrameSize = {};
+            s->hasPreparedFrame = false;
             break;
     }
     return forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
@@ -684,7 +695,8 @@ extern "C"
     }
 
     JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_createDirectXDevice(
-        JNIEnv *env, jobject renderer, jlong adapterPtr, jlong contentHandle, jboolean transparency) {
+        JNIEnv *env, jobject renderer, jlong adapterPtr, jlong contentHandle, jlong compositionTargetHandle,
+        jboolean transparency) {
         gr_cp<IDXGIFactory4> deviceFactory;
         if (!SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&deviceFactory)))) {
             return 0;
@@ -723,7 +735,8 @@ extern "C"
             return 0;
         }
 
-        HWND hWnd = fromJavaPointer<HWND>(contentHandle);
+        HWND contentHWnd = fromJavaPointer<HWND>(contentHandle);
+        HWND hWnd = fromJavaPointer<HWND>(compositionTargetHandle);
         DirectXDevice *d3dDevice = new DirectXDevice();
         d3dDevice->backendContext.fAdapter = adapter;
         d3dDevice->backendContext.fDevice = device;
@@ -735,8 +748,10 @@ extern "C"
         d3dDevice->hWnd = hWnd;
 
         if (transparency) {
-            const LONG style = GetWindowLong(hWnd, GWL_EXSTYLE);
-            SetWindowLong(hWnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
+            // Keep input transparency on the AWT content peer. The optional top-level composition target must remain
+            // hit-testable or the whole application window would become click-through.
+            const LONG style = GetWindowLong(contentHWnd, GWL_EXSTYLE);
+            SetWindowLong(contentHWnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
         }
 
         return toJavaPointer(d3dDevice);
