@@ -928,6 +928,19 @@ extern "C"
         DwmFlush();
     }
 
+    // A Snap transition can supersede a resize frame before its matching WM_WINDOWPOSCHANGED. The frame's Skia
+    // commands have already been submitted, but its fence is normally signalled only after Present. Signal it
+    // directly so ResizeBuffers can safely release the old buffers without presenting pixels for stale geometry.
+    JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_discardPreparedFrame(
+        JNIEnv *env, jobject renderer, jlong devicePtr)
+    {
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (d3dDevice && d3dDevice->fence.get() != nullptr) {
+            const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
+            d3dDevice->queue->Signal(d3dDevice->fence.get(), fenceValue);
+        }
+    }
+
     // Arms the WM_PAINT hold path. Repeated calls coalesce into one update region, so no explicit gate is needed.
     JNIEXPORT void JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_postLiveResizeRender(
         JNIEnv *env, jobject renderer, jlong handle)

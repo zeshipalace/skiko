@@ -334,10 +334,20 @@ internal class Direct3DRenderer(
         if (isResizeFrame) {
             synchronized(drawLock) {
                 if (isDisposed) return
+                // Snap layouts can replace an in-flight resize proposal before WM_WINDOWPOSCHANGED gets a chance
+                // to present it. ResizeBuffers must not wait for that abandoned frame's Present-side fence while
+                // the toolkit thread is waiting for this EDT render and then re-enters the present callback.
+                // Complete the abandoned GPU work without presenting it, then let the replacement frame own the
+                // pending-present slot.
+                val replacedPreparedFrame = hasPreparedLiveResizeFrame
+                if (replacedPreparedFrame) {
+                    discardPreparedFrame(device)
+                    hasPreparedLiveResizeFrame = false
+                }
                 // Prepare the exact-size buffer while Win32 still exposes the preceding geometry. Native code calls
                 // presentPreparedLiveResizeFrame only from WM_WINDOWPOSCHANGED, after these pixels and the HWND bounds
                 // describe the same resize step.
-                if (liveResizeInstalled && isSwapChainInitialized) {
+                if (liveResizeInstalled && isSwapChainInitialized && !replacedPreparedFrame) {
                     waitForNextFrame(device)
                 }
                 drawFrame()
@@ -391,6 +401,7 @@ internal class Direct3DRenderer(
     private external fun postLiveResizeRender(handle: Long)
     private external fun waitForNextFrame(device: Long)
     private external fun waitForComposition(device: Long)
+    private external fun discardPreparedFrame(device: Long)
 
     private external fun flush(context: Long, surface: Long)
 }
