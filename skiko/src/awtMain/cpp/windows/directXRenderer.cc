@@ -186,6 +186,9 @@ struct LiveResizeState {
     bool inSizeMoveLoop = false;    // WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE, which covers plain moves too
     bool liveResizeEngaged = false; // platform-driven frames active (engaged at loop entry, incl. plain moves)
     bool engageOnMove = false;      // engage at WM_ENTERSIZEMOVE, or only at the first actual resize step
+    bool stateChangeInFlight = false; // maximize/restore geometry is being animated by the window manager
+    bool deferResizeEnd = false;    // let the state-change WindowProc return before resuming the EDT scheduler
+    bool sawSizingMessage = false;  // distinguishes an edge resize from a title-bar move that may end in Snap
     SIZE appliedChildSize = {};     // last child size observed on the content HWND; see applyEnforcedChildSize
     bool hasAppliedChildSize = false;
     LONGLONG lastMoveFrameQpc = 0;  // QPC timestamp used to throttle position-message frames
@@ -258,10 +261,10 @@ static void javaOnLiveResizeEnded(LiveResizeState *s) {
     static jmethodID mid = nullptr;
     if (!mid) {
         jclass cls = env->GetObjectClass(s->renderer);
-        mid = env->GetMethodID(cls, "onLiveResizeEnded", "()V");
+        mid = env->GetMethodID(cls, "onLiveResizeEnded", "(Z)V");
         env->DeleteLocalRef(cls);
     }
-    if (mid) env->CallVoidMethod(s->renderer, mid);
+    if (mid) env->CallVoidMethod(s->renderer, mid, (jboolean)s->deferResizeEnd);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
@@ -322,6 +325,30 @@ static void javaPresentPreparedLiveResizeFrame(LiveResizeState *s) {
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
+static void javaDiscardPreparedLiveResizeFrame(LiveResizeState *s) {
+    if (!s->renderer) return;
+    JNIEnv *env = getJniEnv();
+    if (!env) return;
+    static jmethodID mid = nullptr;
+    if (!mid) {
+        jclass cls = env->GetObjectClass(s->renderer);
+        mid = env->GetMethodID(cls, "discardPreparedLiveResizeFrame", "()V");
+        env->DeleteLocalRef(cls);
+    }
+    if (mid) env->CallVoidMethod(s->renderer, mid);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void beginSystemStateChange(LiveResizeState *s) {
+    s->stateChangeInFlight = true;
+    s->deferResizeEnd = true;
+    s->preRenderedFrameSize = {};
+    if (s->hasPreparedFrame) {
+        javaDiscardPreparedLiveResizeFrame(s);
+        s->hasPreparedFrame = false;
+    }
+}
+
 static void driveMoveFrame(LiveResizeState *s) {
     javaDrawFrameWhileLiveResizing(s, /*isResizeFrame*/ false);
 }
@@ -348,7 +375,7 @@ static void renderPendingResizeFrame(LiveResizeState *s, SIZE pendingSize) {
 static LRESULT CALLBACK LiveResizeContentWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     LiveResizeState *s = liveResizeStateFor(hWnd);
     if (!s || s->detached) return forwardToOriginal(s ? s->originalContentProc : nullptr, hWnd, msg, wParam, lParam);
-    if (msg == WM_WINDOWPOSCHANGING && s->liveResizeEngaged) {
+    if (msg == WM_WINDOWPOSCHANGING && s->liveResizeEngaged && !s->stateChangeInFlight) {
         WINDOWPOS *p = (WINDOWPOS *)lParam;
         if (!(p->flags & SWP_NOSIZE))
         {
@@ -392,6 +419,9 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->preRenderedFrameSize = {};
             s->hasPreparedFrame = false;
             s->currentWindowPosResized = false;
+            s->stateChangeInFlight = false;
+            s->deferResizeEnd = false;
+            s->sawSizingMessage = false;
             s->hasAppliedChildSize = false;
             LARGE_INTEGER qpcFrequency;
             QueryPerformanceFrequency(&qpcFrequency);
@@ -411,16 +441,40 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             }
             break;
         }
+        case WM_SIZING:
+            s->sawSizingMessage = true;
+            break;
+        case WM_SYSCOMMAND: {
+            const WPARAM command = wParam & 0xfff0;
+            if (
+                s->inSizeMoveLoop &&
+                (command == SC_MAXIMIZE || command == SC_RESTORE)
+            ) {
+                beginSystemStateChange(s);
+            }
+            break;
+        }
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
             const bool resized = windowPos && !(windowPos->flags & SWP_NOSIZE);
             s->currentWindowPosResized = resized;
+            // Windows marks maximize/restore placement with the long-standing SWP_STATECHANGED bit. Blocking this
+            // message on Compose layout, ResizeBuffers or DwmFlush makes the Snap preview retract first and leaves
+            // a visible pause before DWM can begin its own maximize animation. Let the system commit this transition
+            // immediately; the old surface is suitable for DWM's transition snapshot and is repainted afterwards.
+            constexpr UINT kSwpStateChanged = 0x8000;
+            if (
+                s->inSizeMoveLoop && resized &&
+                ((windowPos->flags & kSwpStateChanged) != 0 || IsZoomed(hWnd))
+            ) {
+                beginSystemStateChange(s);
+            }
             // For custom-decorated windows whose client fills the frame, WINDOWPOS already carries the exact next
             // client size and arrives before WM_NCCALCSIZE. Render here while GetWindowRect and DWM still expose the
             // committed geometry; otherwise a screen sampler (and, on a fast drag, the user) can observe the new
             // outer edge during the few milliseconds spent laying out and presenting from WM_NCCALCSIZE.
             if (
-                s->inSizeMoveLoop && resized &&
+                s->inSizeMoveLoop && resized && !s->stateChangeInFlight &&
                 windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
                 clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
@@ -435,7 +489,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
             // The original procedure may constrain WINDOWPOS. Render its adjusted size before returning as well.
             if (
-                s->inSizeMoveLoop && resized &&
+                s->inSizeMoveLoop && resized && !s->stateChangeInFlight &&
                 windowPos->cx > 0 && windowPos->cy > 0 && IsWindowVisible(hWnd) &&
                 clientAreaFillsWindow(hWnd) && !isPumpingEdt()
             ) {
@@ -452,7 +506,16 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
         case WM_WINDOWPOSCHANGED: {
             WINDOWPOS *windowPos = (WINDOWPOS *)lParam;
             const bool resized = windowPos && !(windowPos->flags & SWP_NOSIZE);
+            const bool completedSystemStateChange = s->stateChangeInFlight;
             const LRESULT result = forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);
+            if (completedSystemStateChange) {
+                // Nested child sizing from the original procedure has now observed stateChangeInFlight and was left
+                // to AWT. Resume platform-driven move frames for any drag that continues after a restore transition.
+                s->stateChangeInFlight = false;
+                s->currentWindowPosResized = false;
+                s->preRenderedFrameSize = {};
+                return result;
+            }
             if (s->inSizeMoveLoop && s->liveResizeEngaged && !resized && !isPumpingEdt()) {
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
@@ -505,7 +568,7 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // thread. Starting a second round-trip would deadlock against the EDT already blocked in SendMessage.
             bool renderedResizeFrame = false;
             if (
-                s->inSizeMoveLoop && s->currentWindowPosResized && wParam &&
+                s->inSizeMoveLoop && s->currentWindowPosResized && !s->stateChangeInFlight && wParam &&
                 IsWindowVisible(hWnd) && !isPumpingEdt()
             )
             {
@@ -539,7 +602,10 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             // peek-and-yield is no alternative because that loop's input is invisible to PeekMessage from in here
             // (both tried). Only WM_PAINT sits below input and so cannot starve the drag. needRender re-arms it by
             // invalidating the frame.
-            if (s->inSizeMoveLoop && s->liveResizeEngaged && !isPumpingEdt()) {
+            if (
+                s->inSizeMoveLoop && s->liveResizeEngaged &&
+                !s->stateChangeInFlight && !isPumpingEdt()
+            ) {
                 ValidateRect(hWnd, nullptr); // before rendering, so the re-arm below isn't cleared
                 // A resize frame is intentionally left in the back buffer until WM_WINDOWPOSCHANGED. Do not let a
                 // nested/early paint advance the swap chain between preparation and that matching geometry commit.
@@ -551,28 +617,41 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             }
             break;
         case WM_EXITSIZEMOVE:
+            // Snap may choose the maximize placement only after WM_EXITSIZEMOVE. A title-bar move therefore has
+            // no state-change WINDOWPOS to detect yet, but synchronously resuming Compose here would still sit
+            // between release and DWM's transition. A real edge resize emits WM_SIZING and keeps its synchronous
+            // final frame; a pure move returns immediately and resumes the scheduler from the EDT queue.
+            s->deferResizeEnd = s->deferResizeEnd || !s->sawSizingMessage;
             if (s->liveResizeEngaged && s->hasPreparedFrame) {
-                // Never abandon a prepared back buffer: the next getBufferIndex would wait for a fence value whose
-                // Signal is issued by Present, deadlocking against the window thread that was meant to perform it.
-                RECT rc = {};
-                GetClientRect(hWnd, &rc);
-                s->enforcedChildSize = { rc.right - rc.left, rc.bottom - rc.top };
-                applyEnforcedChildSize(s);
-                javaPresentPreparedLiveResizeFrame(s);
+                if (s->deferResizeEnd) {
+                    javaDiscardPreparedLiveResizeFrame(s);
+                } else {
+                    // Never abandon a prepared back buffer: the next getBufferIndex would wait for a fence value
+                    // whose Signal is issued by Present, deadlocking against the window thread meant to perform it.
+                    RECT rc = {};
+                    GetClientRect(hWnd, &rc);
+                    s->enforcedChildSize = { rc.right - rc.left, rc.bottom - rc.top };
+                    applyEnforcedChildSize(s);
+                    javaPresentPreparedLiveResizeFrame(s);
+                }
                 s->hasPreparedFrame = false;
             }
             s->inSizeMoveLoop = false;
             s->preRenderedFrameSize = {};
             if (s->liveResizeEngaged) {
                 s->liveResizeEngaged = false;
-                // Ensure the client size is correct when exiting live resize mode
-                if (s->contentHwnd) {
+                // AWT owns child placement during a DWM state transition. Reasserting it synchronously here delays
+                // the system animation; the deferred EDT validation below will settle the final hierarchy instead.
+                if (s->contentHwnd && !s->deferResizeEnd) {
                     RECT rc; GetClientRect(hWnd, &rc);
                     SetWindowPos(s->contentHwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
                                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
                 }
                 javaOnLiveResizeEnded(s);
             }
+            s->stateChangeInFlight = false;
+            s->deferResizeEnd = false;
+            s->sawSizingMessage = false;
             break;
         case WM_DESTROY:
         case WM_NCDESTROY:
@@ -583,6 +662,9 @@ static LRESULT CALLBACK LiveResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LP
             s->preRenderedFrameSize = {};
             s->hasPreparedFrame = false;
             s->currentWindowPosResized = false;
+            s->stateChangeInFlight = false;
+            s->deferResizeEnd = false;
+            s->sawSizingMessage = false;
             break;
     }
     return forwardToOriginal(s->originalProc, hWnd, msg, wParam, lParam);

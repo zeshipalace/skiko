@@ -10,6 +10,7 @@ import java.awt.Container
 import java.awt.Dimension
 import java.awt.Window
 import java.lang.ref.Reference
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
 internal class Direct3DRenderer(
@@ -88,6 +89,7 @@ internal class Direct3DRenderer(
     private var currentWidth = 0
     private var currentHeight = 0
     private var hasPreparedLiveResizeFrame = false
+    private val liveResizeGeneration = AtomicInteger()
     private fun isSurfacesNull() = surfaces.all { it == null }
 
     init {
@@ -273,6 +275,7 @@ internal class Direct3DRenderer(
      */
     @Suppress("unused")
     private fun onLiveResizeStarted() {
+        liveResizeGeneration.incrementAndGet()
         liveResizeListener?.onLiveResizeStarted()
     }
 
@@ -280,14 +283,22 @@ internal class Direct3DRenderer(
      * Called from native code when the live-resize session ends.
      */
     @Suppress("unused")
-    private fun onLiveResizeEnded() {
-        WinApiEdtInvoker.invokeAndWaitWhilePumping {
-            if (isDisposed) return@invokeAndWaitWhilePumping
-            javax.swing.SwingUtilities.getWindowAncestor(layer)?.let {
-                it.invalidate()
-                it.validate()
+    private fun onLiveResizeEnded(deferUntilWindowMessageReturns: Boolean) {
+        val generation = liveResizeGeneration.get()
+        val finishLiveResize = finish@{
+            if (isDisposed) return@finish
+            if (liveResizeGeneration.get() == generation) {
+                javax.swing.SwingUtilities.getWindowAncestor(layer)?.let {
+                    it.invalidate()
+                    it.validate()
+                }
+                liveResizeListener?.onLiveResizeEnded()
             }
-            liveResizeListener?.onLiveResizeEnded()
+        }
+        if (deferUntilWindowMessageReturns) {
+            javax.swing.SwingUtilities.invokeLater(finishLiveResize)
+        } else {
+            WinApiEdtInvoker.invokeAndWaitWhilePumping(finishLiveResize)
         }
     }
 
@@ -372,6 +383,16 @@ internal class Direct3DRenderer(
         swap(withVsync = false)
         waitForComposition(device)
         hasPreparedLiveResizeFrame = false
+    }
+
+    /** Releases a superseded prepared frame without displaying pixels for its stale geometry. */
+    @Suppress("unused")
+    private fun discardPreparedLiveResizeFrame() {
+        synchronized(drawLock) {
+            if (isDisposed || !hasPreparedLiveResizeFrame) return
+            discardPreparedFrame(device)
+            hasPreparedLiveResizeFrame = false
+        }
     }
 
     private external fun chooseAdapter(adapterPriority: Int): Long
