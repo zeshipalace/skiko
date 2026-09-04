@@ -10,6 +10,10 @@ import java.awt.Container
 import java.awt.Dimension
 import java.awt.Window
 import java.lang.ref.Reference
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
@@ -90,6 +94,9 @@ internal class Direct3DRenderer(
     private var currentHeight = 0
     private var hasPreparedLiveResizeFrame = false
     private val liveResizeGeneration = AtomicInteger()
+    private val resourceCacheCleanupConfig = direct3DResourceCacheCleanupConfigFromSystemProperties()
+    private val resourceCacheCleanupFailureLogged = AtomicBoolean()
+    private var resourceCacheCleanupTask: ScheduledFuture<*>? = null
     private fun isSurfacesNull() = surfaces.all { it == null }
 
     init {
@@ -97,6 +104,8 @@ internal class Direct3DRenderer(
     }
 
     override fun releaseResources() = synchronized(drawLock) {
+        resourceCacheCleanupTask?.cancel(false)
+        resourceCacheCleanupTask = null
         if (liveResizeInstalled) {
             uninstallLiveResizeHook(liveResizeHandle)
             liveResizeHandle = 0L
@@ -162,12 +171,57 @@ internal class Direct3DRenderer(
                 val newContext = DirectContext(makeDirectXContext(device))
                 context = newContext
                 onContextInitialized(newContext, layer.properties.gpuResourceCacheLimit) { renderInfo }
+                startResourceCacheCleanup()
             } catch (e: Exception) {
                 Logger.warn(e) { "Failed to create Skia Direct3D context!" }
                 return false
             }
         }
         return true
+    }
+
+    /**
+     * Skia's byte limit only purges the GPU cache after it crosses that limit. Image-heavy UIs can therefore
+     * leave a large number of unlocked raster uploads below the limit indefinitely. Periodic deferred cleanup
+     * preserves the recently used working set while releasing old textures even when rendering becomes idle.
+     *
+     * Direct3D has no thread-affine current context. [drawLock] still serializes the cleanup with every draw,
+     * resize and context disposal because GrDirectContext itself is not thread-safe.
+     */
+    private fun startResourceCacheCleanup() {
+        val config = resourceCacheCleanupConfig ?: return
+        if (resourceCacheCleanupTask != null) return
+        resourceCacheCleanupTask = direct3DResourceCacheCleanupExecutor.scheduleWithFixedDelay(
+            {
+                try {
+                    synchronized(drawLock) {
+                        if (isDisposed) return@synchronized
+                        val currentContext = context ?: return@synchronized
+                        val releasedBytes = try {
+                            performResourceCacheCleanup(
+                                getPtr(currentContext),
+                                config.maxUnusedMillis
+                            )
+                        } finally {
+                            Reference.reachabilityFence(currentContext)
+                        }
+                        if (config.logReleases && releasedBytes > 0L) {
+                            Logger.info {
+                                "Direct3D deferred resource cleanup released " +
+                                    "${releasedBytes / BytesPerMiB} MiB of Skia GPU cache"
+                            }
+                        }
+                    }
+                } catch (error: Throwable) {
+                    if (resourceCacheCleanupFailureLogged.compareAndSet(false, true)) {
+                        Logger.warn(error) { "Direct3D deferred resource cleanup failed" }
+                    }
+                }
+            },
+            config.intervalMillis,
+            config.intervalMillis,
+            TimeUnit.MILLISECONDS
+        )
     }
 
     private fun LayerDrawScope.initSurface() {
@@ -423,6 +477,68 @@ internal class Direct3DRenderer(
     private external fun waitForNextFrame(device: Long)
     private external fun waitForComposition(device: Long)
     private external fun discardPreparedFrame(device: Long)
+    private external fun performResourceCacheCleanup(context: Long, maxUnusedMillis: Long): Long
 
     private external fun flush(context: Long, surface: Long)
 }
+
+private data class Direct3DResourceCacheCleanupConfig(
+    val maxUnusedMillis: Long,
+    val intervalMillis: Long,
+    val logReleases: Boolean
+)
+
+private fun parseDirect3DResourceCacheCleanupConfig(
+    maxUnusedMillis: String?,
+    intervalMillis: String?,
+    logReleases: String?
+): Direct3DResourceCacheCleanupConfig? {
+    if (maxUnusedMillis == null) return null
+    val maxUnused = maxUnusedMillis.toLongOrNull()
+        ?: throw IllegalArgumentException(
+            "Invalid skiko.gpu.resourceCacheCleanup.maxUnusedMillis: $maxUnusedMillis"
+        )
+    if (maxUnused < 0L) return null
+
+    val interval = intervalMillis?.toLongOrNull()
+        ?: if (intervalMillis == null) DefaultResourceCacheCleanupIntervalMillis else {
+            throw IllegalArgumentException(
+                "Invalid skiko.gpu.resourceCacheCleanup.intervalMillis: $intervalMillis"
+            )
+        }
+    require(interval > 0L) {
+        "skiko.gpu.resourceCacheCleanup.intervalMillis must be greater than zero"
+    }
+    return Direct3DResourceCacheCleanupConfig(
+        maxUnusedMillis = maxUnused,
+        intervalMillis = interval,
+        logReleases = logReleases?.toBoolean() ?: false
+    )
+}
+
+private fun direct3DResourceCacheCleanupConfigFromSystemProperties() =
+    parseDirect3DResourceCacheCleanupConfig(
+        maxUnusedMillis = System.getProperty(ResourceCacheCleanupMaxUnusedMillisProperty),
+        intervalMillis = System.getProperty(ResourceCacheCleanupIntervalMillisProperty),
+        logReleases = System.getProperty(ResourceCacheCleanupLogProperty)
+    )
+
+private val direct3DResourceCacheCleanupExecutor by lazy {
+    ScheduledThreadPoolExecutor(1) { command ->
+        Thread(command, "Skiko Direct3D resource cache cleanup").apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY - 1
+        }
+    }.apply {
+        removeOnCancelPolicy = true
+    }
+}
+
+private const val ResourceCacheCleanupMaxUnusedMillisProperty =
+    "skiko.gpu.resourceCacheCleanup.maxUnusedMillis"
+private const val ResourceCacheCleanupIntervalMillisProperty =
+    "skiko.gpu.resourceCacheCleanup.intervalMillis"
+private const val ResourceCacheCleanupLogProperty =
+    "skiko.gpu.resourceCacheCleanup.log"
+private const val DefaultResourceCacheCleanupIntervalMillis = 1_000L
+private const val BytesPerMiB = 1024L * 1024L
