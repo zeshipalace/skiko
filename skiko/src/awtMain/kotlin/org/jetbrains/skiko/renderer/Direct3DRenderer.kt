@@ -92,6 +92,8 @@ internal class Direct3DRenderer(
     private val liveResizeGeneration = AtomicInteger()
     private val purgeableResourceCacheLimit = direct3DPurgeableResourceCacheLimitFromSystemProperties()
     private val logResourceCacheTrims = System.getProperty(ResourceCacheTrimLogProperty)?.toBoolean() ?: false
+    // Kept as an internal diagnostic for integration/stress tests; it does not participate in collection policy.
+    private var resourceCacheTrimmedBytes = 0L
     private fun isSurfacesNull() = surfaces.all { it == null }
 
     init {
@@ -227,10 +229,14 @@ internal class Direct3DRenderer(
                 getPtr(surface),
                 purgeableResourceCacheLimit
             )
-            if (logResourceCacheTrims && releasedBytes > 0L) {
-                Logger.info {
-                    "Direct3D resource cache released ${releasedBytes / BytesPerMiB} MiB " +
-                        "after GPU submit"
+            if (releasedBytes > 0L) {
+                resourceCacheTrimmedBytes = (resourceCacheTrimmedBytes + releasedBytes)
+                    .coerceAtLeast(resourceCacheTrimmedBytes)
+                if (logResourceCacheTrims) {
+                    Logger.info {
+                        "Direct3D resource cache released ${releasedBytes / BytesPerMiB} MiB " +
+                            "after GPU submit"
+                    }
                 }
             }
         } finally {
