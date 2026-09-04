@@ -91,8 +91,10 @@ internal class Direct3DRenderer(
     private var hasPreparedLiveResizeFrame = false
     private val liveResizeGeneration = AtomicInteger()
     private val purgeableResourceCacheLimit = direct3DPurgeableResourceCacheLimitFromSystemProperties()
-    private val logResourceCacheTrims = System.getProperty(ResourceCacheTrimLogProperty)?.toBoolean() ?: false
+    private val logResourceCacheTrims =
+        System.getProperty("skiko.gpu.resourceCacheTrim.log")?.toBoolean() ?: false
     // Kept as an internal diagnostic for integration/stress tests; it does not participate in collection policy.
+    @Volatile
     private var resourceCacheTrimmedBytes = 0L
     private fun isSurfacesNull() = surfaces.all { it == null }
 
@@ -234,7 +236,7 @@ internal class Direct3DRenderer(
                     .coerceAtLeast(resourceCacheTrimmedBytes)
                 if (logResourceCacheTrims) {
                     Logger.info {
-                        "Direct3D resource cache released ${releasedBytes / BytesPerMiB} MiB " +
+                        "Direct3D resource cache released ${releasedBytes / (1024L * 1024L)} MiB " +
                             "after GPU submit"
                     }
                 }
@@ -442,35 +444,28 @@ internal class Direct3DRenderer(
     private external fun waitForComposition(device: Long)
     private external fun discardPreparedFrame(device: Long)
     private external fun flush(context: Long, surface: Long, purgeableResourceCacheLimit: Long): Long
-}
 
-private fun direct3DPurgeableResourceCacheLimitFromSystemProperties(): Long {
-    val value = System.getProperty(PurgeableResourceCacheLimitProperty) ?: return -1L
-    val normalized = value.trim().uppercase()
-    val multiplier = when {
-        normalized.endsWith("K") -> 1024L
-        normalized.endsWith("M") -> 1024L * 1024L
-        normalized.endsWith("G") -> 1024L * 1024L * 1024L
-        else -> 1L
-    }
-    val numericPart = if (multiplier == 1L) normalized else normalized.dropLast(1)
-    val limit = numericPart.toLongOrNull()?.let { number ->
-        try {
-            Math.multiplyExact(number, multiplier)
-        } catch (_: ArithmeticException) {
-            null
+    private fun direct3DPurgeableResourceCacheLimitFromSystemProperties(): Long {
+        val propertyName = "skiko.gpu.resourceCachePurgeableBytesLimit"
+        val value = System.getProperty(propertyName) ?: return -1L
+        val normalized = value.trim().uppercase()
+        val multiplier = when {
+            normalized.endsWith("K") -> 1024L
+            normalized.endsWith("M") -> 1024L * 1024L
+            normalized.endsWith("G") -> 1024L * 1024L * 1024L
+            else -> 1L
         }
-    } ?: throw IllegalArgumentException(
-        "Invalid $PurgeableResourceCacheLimitProperty: $value"
-    )
-    require(limit >= -1L) {
-        "$PurgeableResourceCacheLimitProperty must be -1 or greater"
+        val numericPart = if (multiplier == 1L) normalized else normalized.dropLast(1)
+        val limit = numericPart.toLongOrNull()?.let { number ->
+            try {
+                Math.multiplyExact(number, multiplier)
+            } catch (_: ArithmeticException) {
+                null
+            }
+        } ?: throw IllegalArgumentException("Invalid $propertyName: $value")
+        require(limit >= -1L) {
+            "$propertyName must be -1 or greater"
+        }
+        return limit
     }
-    return limit
 }
-
-private const val PurgeableResourceCacheLimitProperty =
-    "skiko.gpu.resourceCachePurgeableBytesLimit"
-private const val ResourceCacheTrimLogProperty =
-    "skiko.gpu.resourceCacheTrim.log"
-private const val BytesPerMiB = 1024L * 1024L
