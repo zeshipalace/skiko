@@ -152,6 +152,7 @@ internal class Direct3DRenderer(
     }
 
     private fun LayerDrawScope.drawFrame() {
+        val cacheFrameStart = if (purgeableResourceCacheLimit >= 0L) resourceCacheFrameStart() else 0L
         if (!ensureContext()) {
             throw RenderException("Cannot init graphic Direct3D context")
         }
@@ -160,7 +161,7 @@ internal class Direct3DRenderer(
             clear(Color.TRANSPARENT)
             layer.draw(this)
         }
-        flushFrame()
+        flushFrame(cacheFrameStart)
     }
 
     private fun ensureContext(): Boolean {
@@ -223,14 +224,15 @@ internal class Direct3DRenderer(
         return false
     }
 
-    private fun flushFrame() {
+    private fun flushFrame(cacheFrameStart: Long) {
         val context = context ?: return
         val surface = surface ?: return
         try {
             val releasedBytes = flush(
                 getPtr(context),
                 getPtr(surface),
-                purgeableResourceCacheLimit
+                purgeableResourceCacheLimit,
+                cacheFrameStart
             )
             if (releasedBytes > 0L) {
                 resourceCacheTrimmedBytes = (resourceCacheTrimmedBytes + releasedBytes)
@@ -444,7 +446,8 @@ internal class Direct3DRenderer(
     private external fun waitForNextFrame(device: Long)
     private external fun waitForComposition(device: Long)
     private external fun discardPreparedFrame(device: Long)
-    private external fun flush(context: Long, surface: Long, purgeableResourceCacheLimit: Long): Long
+    private external fun resourceCacheFrameStart(): Long
+    private external fun flush(context: Long, surface: Long, purgeableResourceCacheLimit: Long, frameStartNanos: Long): Long
 
     private fun direct3DPurgeableResourceCacheLimitFromSystemProperties(): Long {
         return direct3DMemorySizeFromSystemProperties("skiko.gpu.resourceCachePurgeableBytesLimit", -1L)
