@@ -23,6 +23,8 @@
   - Windows Snap 动画无阻塞(voxzen.19):最大化/还原的 `WINDOWPOS` 带 `SWP_STATECHANGED`,这类几何由 DWM 自己做过渡动画;若仍在 `WM_WINDOWPOSCHANGING` 中同步执行 Compose 布局、`ResizeBuffers`、Present 和 `DwmFlush`,Snap 预览会先退回原窗口并停顿,等窗口过程返回才开始最大化。现在状态切换只让系统立即提交几何并沿用旧 surface 作为 DWM 动画快照,过期候选帧只完成 fence 而不显示;同时覆盖系统在 `WM_EXITSIZEMOVE` 之后才决定最大化的时序:纯标题栏移动的收尾不再同步校验布局和强制绘帧,窗口过程返回后才从 EDT 队列恢复 scheduler、校验最终层级并重绘。真正的边缘拖拽以 `WM_SIZING` 区分,仍走同步预渲染和同步收尾,保留 Acrylic 与无白线/残影效果
   - Windows Direct3D 提交驱动纹理回收(voxzen.21):`skiko.gpu.resourceCacheLimit` 是整个 Ganesh 缓存的硬上限,带 key 的图片上传和可复用 scratch 资源低于上限时会继续常驻。新增 `skiko.gpu.resourceCachePurgeableBytesLimit`;每次 `submit(kYes)` 完成后只做 O(1) 的可回收字节检查,超出软上限时才从 Skia 原生 purgeable 队列增量释放超额部分。仍被当前帧、图片代理或 GPU command buffer 引用的资源不会进入该队列;已失效的动态位图代际会丢失 unique key 并转为 scratch,回收时优先释放这类 scratch,不足时再按原生 LRU 淘汰普通图片纹理,持续命中的高频纹理会留在 MRU 端。该实现没有定时器、后台线程或按时间扫描,其生命周期边界与 Rust/wgpu 在 GPU submission 完成后回收资源的模型一致;设为 `-1` 或不设置时保持上游行为,设为 `0` 时接近立即释放,建议 UI 应用保留 `64M` 复用池。`skiko.gpu.resourceCacheTrim.log=true` 可记录实际释放量。实现仅改变 Direct3D 内部 private JNI,不改变任何既有公开类、构造器或方法签名
 
+  - Windows Direct3D 可配置原生堆块(voxzen.22):通过 Ganesh 既有 `fMemoryAllocator` 扩展点复用与 Skia 完全同版本的 D3D12MA,新增 `skiko.rendering.windows.direct3DHeapBlockSize` 调整底层 suballocation 粒度,减少小纹理长期存活导致的大堆块空闲空间常驻。默认 `0` 保留 Skia 原行为;Voxzen Windows 使用 `8M`。资源仍由引用计数和 GPU 完成边界释放,不引入扫描或定时器,不改变公开 JVM 签名;核心 jar 与原生 runtime 必须成套升级
+
 ### CMP 兼容性
 
 当前分支已进入 master(0.152.x 线),与 CMP 1.12.0 **二进制不兼容**,实测:
@@ -36,10 +38,28 @@
 ## 本地迭代(开发机)
 
 ```bash
-./gradlew -p skiko publishToMavenLocal -Pdeploy.release=true
+./gradlew -p skiko :publishToMavenLocal -Pdeploy.release=true
 ```
 
-发布到本机 `~/.m2`,版本号与 GitHub Packages 相同;Voxzen 的仓库配置中 mavenLocal 在前,本地构建自动遮蔽远端,改代码后重跑即可,**不需要改版本号**。
+发布到本机 `~/.m2`,版本号与 GitHub Packages 相同,**不需要改版本号**。Voxzen 正常发布配置解析 GitHub Packages;Windows 本地验证通过 `-Pvoxzen.skiko.mavenLocal=true` 成套选择本地核心 jar 与 Windows x64 runtime,不会把本地 DLL 与远端核心 jar 混用。Salt UI 传递引入的其它平台 runtime 仍从远端解析。此开关仅供显式本地验证,不能提交依赖本机 MavenLocal 的默认配置。
+
+本机 Windows 工具链位于 `C:\Apps\VSBuildTools2022`,PowerShell 本地构建示例:
+
+```powershell
+$env:SKIKO_VSBT_PATH = 'C:\Apps\VSBuildTools2022'
+$env:PATH = 'C:\Apps\VSBuildTools2022\VC\Tools\Llvm\x64\bin;' + $env:PATH
+.\gradlew.bat -p skiko :publishToMavenLocal '-Pdeploy.release=true'
+```
+
+### Direct3D 堆分配配置(voxzen.22)
+
+`skiko.rendering.windows.direct3DHeapBlockSize` 可以设置 D3D12MA 的首选堆块大小,默认 `0` 完整保留 Skia 的默认分配器。非零值只调整底层 suballocation 粒度,不改变 Skia 的资源引用计数、GPU fence 或纹理逐出策略,没有定时扫描。允许 `1M` 至 `256M` 的 2 次幂,例如 `16M`。
+
+仅调整 private JNI,不改变既有公开 Kotlin/JVM 或 Skia API。D3D12MA 头文件固定为当前 Skia DEPS 使用的提交,实现复用预编译 Skia 中的同版本代码。升级 Skia 时必须重新核对该提交,不得混用任意新版本头文件。
+
+Voxzen Windows 配置使用 `8M`,其它调用方仍保持默认 `0`。独立预热、同一窗口位置的纹理 churn 测试覆盖 16M、8M、4M 并通过回收量与帧间隔阈值;本地发布前验证中 8M 与默认值的 p95 分别为 12.57ms 和 12.61ms。首窗口与后续窗口存在显著帧时钟预热差异,不得把未经预热或单次波动当成性能收益。
+
+2026-09-05 本机 Release 候选应用同时使用确定性封面像素所有权、解码背压、NIO 临时缓冲上限和 G1 并发显式回收,可交互首屏私有工作集约 286MiB,列表滚动采样峰值约 476MiB。总工作集和提交量仍超过 500MiB,不能宣布所有场景达标;这些是组合方案结果,不是单独调整堆块的收益。本次发布交付已经验证的优化,不代表内存或零性能损失目标已全面完成。完整口径、限制及复现步骤记录于 Voxzen `docs/windows-memory-budget-2026-09-05.zh-CN.md`。
 
 注意:不要省略 `-Pdeploy.release=true`(省略会追加 `-SNAPSHOT` 后缀,与 Voxzen 锁定的版本号对不上)。
 

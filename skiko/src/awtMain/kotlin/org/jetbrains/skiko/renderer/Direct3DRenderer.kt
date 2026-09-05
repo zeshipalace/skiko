@@ -23,6 +23,7 @@ internal class Direct3DRenderer(
     private var isSwapChainInitialized = false
     private val synchronousLiveResizeRequested =
         layer.fillsWindow && SkikoProperties.direct3DSynchronousLiveResize
+    private val resourceHeapBlockSize = direct3DResourceHeapBlockSizeFromSystemProperties()
 
     // Native LiveResizeState, 0 if the hook isn't installed.
     private var liveResizeHandle: Long = 0L
@@ -165,7 +166,7 @@ internal class Direct3DRenderer(
     private fun ensureContext(): Boolean {
         if (context == null) {
             try {
-                val newContext = DirectContext(makeDirectXContext(device))
+                val newContext = DirectContext(makeDirectXContext(device, resourceHeapBlockSize))
                 context = newContext
                 onContextInitialized(newContext, layer.properties.gpuResourceCacheLimit) { renderInfo }
             } catch (e: Exception) {
@@ -422,7 +423,7 @@ internal class Direct3DRenderer(
         compositionTargetHandle: Long,
         transparency: Boolean
     ): Long
-    private external fun makeDirectXContext(device: Long): Long
+    private external fun makeDirectXContext(device: Long, preferredHeapBlockSize: Long): Long
     private external fun makeDirectXSurface(device: Long, context: Long, width: Int, height: Int, surfacePropsIntArray: InteropPointer, index: Int): Long
     private external fun resizeBuffers(device: Long, width: Int, height: Int)
     private external fun swap(device: Long, isVsyncEnabled: Boolean)
@@ -446,8 +447,20 @@ internal class Direct3DRenderer(
     private external fun flush(context: Long, surface: Long, purgeableResourceCacheLimit: Long): Long
 
     private fun direct3DPurgeableResourceCacheLimitFromSystemProperties(): Long {
-        val propertyName = "skiko.gpu.resourceCachePurgeableBytesLimit"
-        val value = System.getProperty(propertyName) ?: return -1L
+        return direct3DMemorySizeFromSystemProperties("skiko.gpu.resourceCachePurgeableBytesLimit", -1L)
+    }
+
+    private fun direct3DResourceHeapBlockSizeFromSystemProperties(): Long {
+        val propertyName = "skiko.rendering.windows.direct3DHeapBlockSize"
+        val size = direct3DMemorySizeFromSystemProperties(propertyName, 0L)
+        require(size == 0L || (size in (1024L * 1024)..(256L * 1024 * 1024) && size and (size - 1) == 0L)) {
+            "$propertyName must be 0 (Skia default) or a power of two between 1M and 256M"
+        }
+        return size
+    }
+
+    private fun direct3DMemorySizeFromSystemProperties(propertyName: String, defaultValue: Long): Long {
+        val value = System.getProperty(propertyName) ?: return defaultValue
         val normalized = value.trim().uppercase()
         val multiplier = when {
             normalized.endsWith("K") -> 1024L
