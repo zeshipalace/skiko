@@ -25,6 +25,8 @@
 
   - Windows Direct3D 可配置原生堆块(voxzen.22):通过 Ganesh 既有 `fMemoryAllocator` 扩展点复用与 Skia 完全同版本的 D3D12MA,新增 `skiko.rendering.windows.direct3DHeapBlockSize` 调整底层 suballocation 粒度,减少小纹理长期存活导致的大堆块空闲空间常驻。默认 `0` 保留 Skia 原行为;Voxzen Windows 使用 `8M`。资源仍由引用计数和 GPU 完成边界释放,不引入扫描或定时器,不改变公开 JVM 签名;核心 jar 与原生 runtime 必须成套升级
 
+  - Windows Direct3D 热图层复用保护(voxzen.23):纠正 `.21/.22` 将整个 purgeable 池按字节强压到软上限的策略。全窗口 blur/saveLayer 渲染目标每帧解锁后也进入 scratch 池,并不等于冷资源;16M 配置会导致约 13–15GiB/s 的反复淘汰,让 160Hz Debug 播放页降至约 101FPS。现在记录本帧起点,提交后借助 Ganesh 原生有序 LRU 仅回收本帧之前解锁的冷资源,保护本帧使用过的热目标;原属性成为回收触发阈值,总缓存预算保持独立。没有新增定时任务或全量纹理扫描,仅使用实际帧生命周期映射到 Skia 的公开 cleanup API。此前“MRU 高频纹理一定保留”的描述不适用于字节上限小于热工作集的情况,应以本条与 [帧边界回收说明](skiko/docs/windows-direct3d-frame-cache.md) 为准。大窗口热图层回归从 90 帧淘汰 1602MiB 降为 0,停用图层后回收 30MiB,Debug 最大化/全屏播放约 160FPS;公开 JVM ABI 不变,私有 JNI 仍要求核心 jar 与 native runtime 成套升级
+
 ### CMP 兼容性
 
 当前分支已进入 master(0.152.x 线),与 CMP 1.12.0 **二进制不兼容**,实测:
