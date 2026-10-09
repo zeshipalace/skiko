@@ -8,20 +8,11 @@
 #include "window_util.h"
 #include "winApiEdtInvoker.h"
 
-#include "SkColorSpace.h"
-#include "ganesh/GrBackendSurface.h"
-#include "ganesh/GrDirectContext.h"
-#include "ganesh/d3d/GrD3DDirectContext.h"
-#include "SkSurface.h"
-#include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "interop.hh"
 #include "DCompLibrary.h"
 
-#include "ganesh/d3d/GrD3DTypes.h"
-#include "ganesh/d3d/GrD3DBackendSurface.h"
+#include <wrl/client.h>
 #include <d3d12sdklayers.h>
-#include "ganesh/d3d/GrD3DBackendContext.h"
-#include "direct3DMemoryAllocator.h"
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
@@ -30,20 +21,26 @@
 extern "C" JavaVM *jvm;
 
 const int BuffersCount = 2;
+const D3D_FEATURE_LEVEL minSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
+const D3D_FEATURE_LEVEL featureLevels[] = {
+    // TODO add D3D_FEATURE_LEVEL_12_2
+    D3D_FEATURE_LEVEL_12_1,
+    D3D_FEATURE_LEVEL_12_0
+};
 
 class DirectXDevice
 {
 public:
     HWND hWnd; // Handle of native view.
-    GrD3DBackendContext backendContext;
-    gr_cp<ID3D12Device> device;
-    gr_cp<IDXGISwapChain3> swapChain;
-    gr_cp<ID3D12CommandQueue> queue;
-    gr_cp<ID3D12Resource> buffers[BuffersCount];
-    gr_cp<ID3D12Fence> fence;
-    gr_cp<IDCompositionDevice> dcDevice;
-    gr_cp<IDCompositionTarget> dcTarget;
-    gr_cp<IDCompositionVisual> dcVisual;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffers[BuffersCount];
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::ComPtr<IDCompositionDevice> dcDevice;
+    Microsoft::WRL::ComPtr<IDCompositionTarget> dcTarget;
+    Microsoft::WRL::ComPtr<IDCompositionVisual> dcVisual;
     uint64_t fenceValues[BuffersCount];
     HANDLE fenceEvent = NULL;
     HANDLE frameLatencyWaitableObject = NULL;
@@ -62,17 +59,17 @@ public:
         }
         for (int i = 0; i < BuffersCount; i++)
         {
-            buffers[i].reset(nullptr);
+            buffers[i].Reset();
         }
-        fence.reset(nullptr);
-        swapChain.reset(nullptr);
-        queue.reset(nullptr);
-        device.reset(nullptr);
+        fence.Reset();
+        swapChain.Reset();
+        queue.Reset();
+        device.Reset();
     }
 
     void initSwapChain(UINT width, UINT height, jboolean transparency, jboolean synchronousLiveResize) {
-        gr_cp<IDXGIFactory4> swapChainFactory4;
-        gr_cp<IDXGISwapChain1> swapChain1;
+        Microsoft::WRL::ComPtr<IDXGIFactory4> swapChainFactory4;
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain1;
         CreateDXGIFactory2(0, IID_PPV_ARGS(&swapChainFactory4));
         HRESULT result = S_OK;
         swapChainFlags = synchronousLiveResize ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
@@ -82,17 +79,17 @@ public:
         // at every new size.
         DXGI_SCALING scaling = synchronousLiveResize && !transparency ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
         if (transparency) {
-            result = CreateSwapChainForComposition(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            result = CreateSwapChainForComposition(swapChainFactory4.Get(), width, height, swapChain1.GetAddressOf());
             // FRAME_LATENCY_WAITABLE_OBJECT is available since Windows 8.1. If a driver rejects it, retry the same
             // transparent composition path without the flag rather than losing Acrylic/Mica by falling through to
             // the opaque HWND swap chain.
             if (FAILED(result) && swapChainFlags != 0) {
-                swapChain1.reset(nullptr);
-                dcVisual.reset(nullptr);
-                dcTarget.reset(nullptr);
-                dcDevice.reset(nullptr);
+                swapChain1.Reset();
+                dcVisual.Reset();
+                dcTarget.Reset();
+                dcDevice.Reset();
                 swapChainFlags = 0;
-                result = CreateSwapChainForComposition(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+                result = CreateSwapChainForComposition(swapChainFactory4.Get(), width, height, swapChain1.GetAddressOf());
             }
         }
         if (!transparency || FAILED(result)) {
@@ -100,28 +97,28 @@ public:
              * It's just a fallback path that added for compatibility.
              * In this case transparency won't be supported.
             */
-            swapChain1.reset(nullptr);
-            result = CreateSwapChainForHwnd(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+            swapChain1.Reset();
+            result = CreateSwapChainForHwnd(swapChainFactory4.Get(), width, height, scaling, swapChain1.GetAddressOf());
             if (FAILED(result) && swapChainFlags != 0) {
-                swapChain1.reset(nullptr);
+                swapChain1.Reset();
                 swapChainFlags = 0;
-                result = CreateSwapChainForHwnd(swapChainFactory4.get(), width, height, scaling, &swapChain1);
+                result = CreateSwapChainForHwnd(swapChainFactory4.Get(), width, height, scaling, swapChain1.GetAddressOf());
             }
         }
         swapChainFactory4->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER);
         if (SUCCEEDED(result)) {
             swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain));
         }
-        if (swapChain.get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
+        if (swapChain.Get() != nullptr && swapChainFlags != 0 && SUCCEEDED(swapChain->SetMaximumFrameLatency(1))) {
             // A waitable swap chain has its own latency limit. Keep no more than the current frame queued so a burst
             // of resize messages cannot leave DirectComposition several frames behind the Win32 window geometry.
             frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
         }
-        swapChainFactory4.reset(nullptr);
+        swapChainFactory4.Reset();
     }
 
 private:
-    HRESULT CreateSwapChainForComposition(IDXGIFactory4 *swapChainFactory4, UINT width, UINT height, DXGI_SCALING scaling, IDXGISwapChain1 **swapChain1) {
+    HRESULT CreateSwapChainForComposition(IDXGIFactory4 *swapChainFactory4, UINT width, UINT height, IDXGISwapChain1 **swapChain1) {
         DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
         swapChainDesc.Width = width;
         swapChainDesc.Height = height;
@@ -130,11 +127,11 @@ private:
         swapChainDesc.SampleDesc.Quality = 0;
         swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         swapChainDesc.BufferCount = BuffersCount;
-        swapChainDesc.Scaling = scaling;
+        swapChainDesc.Scaling = DXGI_SCALING_STRETCH; // CreateSwapChainForComposition requires DXGI_SCALING_STRETCH
         swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         swapChainDesc.Flags = swapChainFlags;
-        HRESULT result = swapChainFactory4->CreateSwapChainForComposition(queue.get(), &swapChainDesc, nullptr, swapChain1);
+        HRESULT result = swapChainFactory4->CreateSwapChainForComposition(queue.Get(), &swapChainDesc, nullptr, swapChain1);
         if (FAILED(result)) { return result; }
 
         result = DCompLibrary::DCompositionCreateDevice(0, IID_PPV_ARGS(&dcDevice));
@@ -145,7 +142,7 @@ private:
         if (FAILED(result)) { return result; }
         result = dcVisual->SetContent(*swapChain1);
         if (FAILED(result)) { return result; }
-        result = dcTarget->SetRoot(dcVisual.get());
+        result = dcTarget->SetRoot(dcVisual.Get());
         if (FAILED(result)) { return result; }
         result = dcDevice->Commit();
         if (FAILED(result)) { return result; }
@@ -165,7 +162,7 @@ private:
         swapChainDesc.Scaling = scaling;
         swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         swapChainDesc.Flags = swapChainFlags;
-        return swapChainFactory4->CreateSwapChainForHwnd(queue.get(), hWnd, &swapChainDesc, nullptr, nullptr, swapChain1);
+        return swapChainFactory4->CreateSwapChainForHwnd(queue.Get(), hWnd, &swapChainDesc, nullptr, nullptr, swapChain1);
     }
 };
 
@@ -821,12 +818,12 @@ extern "C"
 
     JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_chooseAdapter(
             JNIEnv *env, jobject renderer, jint adapterPriority) {
-        gr_cp<IDXGIFactory4> deviceFactory;
+        Microsoft::WRL::ComPtr<IDXGIFactory4> deviceFactory;
         if (!SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&deviceFactory)))) {
             return 0;
         }
 
-        gr_cp<IDXGIFactory6> factory6;
+        Microsoft::WRL::ComPtr<IDXGIFactory6> factory6;
         if (!SUCCEEDED(deviceFactory->QueryInterface(IID_PPV_ARGS(&factory6)))) {
             return 0;
         }
@@ -837,7 +834,7 @@ extern "C"
                 break;
             }
             if (
-                SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device), nullptr)) &&
+                SUCCEEDED(D3D12CreateDevice(adapter, minSupportedFeatureLevel, _uuidof(ID3D12Device), nullptr)) &&
                 isAdapterSupported(env, renderer, adapter)
             ) {
                 return toJavaPointer(adapter);
@@ -852,36 +849,32 @@ extern "C"
     JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_createDirectXDevice(
         JNIEnv *env, jobject renderer, jlong adapterPtr, jlong contentHandle, jlong compositionTargetHandle,
         jboolean transparency) {
-        gr_cp<IDXGIFactory4> deviceFactory;
+        Microsoft::WRL::ComPtr<IDXGIFactory4> deviceFactory;
         if (!SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&deviceFactory)))) {
             return 0;
         }
         if (adapterPtr == 0) {
             return 0;
         }
-        gr_cp<IDXGIAdapter1> adapter((IDXGIAdapter1 *) adapterPtr);
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        adapter.Attach((IDXGIAdapter1 *) adapterPtr);
 
-        D3D_FEATURE_LEVEL maxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
-        D3D_FEATURE_LEVEL featureLevels[] = {
-            // TODO add D3D_FEATURE_LEVEL_12_2
-            D3D_FEATURE_LEVEL_12_1,
-            D3D_FEATURE_LEVEL_12_0
-        };
+        D3D_FEATURE_LEVEL maxSupportedFeatureLevel = minSupportedFeatureLevel;
 
         for (int i = 0; i < _countof(featureLevels); i++) {
-            if (SUCCEEDED(D3D12CreateDevice(adapter.get(), featureLevels[i], _uuidof(ID3D12Device), nullptr))) {
+            if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), featureLevels[i], _uuidof(ID3D12Device), nullptr))) {
                 maxSupportedFeatureLevel = featureLevels[i];
                 break;
             }
         }
 
-        gr_cp<ID3D12Device> device;
-        if (!SUCCEEDED(D3D12CreateDevice(adapter.get(), maxSupportedFeatureLevel, IID_PPV_ARGS(&device)))) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        if (!SUCCEEDED(D3D12CreateDevice(adapter.Get(), maxSupportedFeatureLevel, IID_PPV_ARGS(&device)))) {
             return 0;
         }
 
         // Create the command queue
-        gr_cp<ID3D12CommandQueue> queue;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC queueDesc = {};
         queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -893,11 +886,7 @@ extern "C"
         HWND contentHWnd = fromJavaPointer<HWND>(contentHandle);
         HWND hWnd = fromJavaPointer<HWND>(compositionTargetHandle);
         DirectXDevice *d3dDevice = new DirectXDevice();
-        d3dDevice->backendContext.fAdapter = adapter;
-        d3dDevice->backendContext.fDevice = device;
-        d3dDevice->backendContext.fQueue = queue;
-        d3dDevice->backendContext.fProtectedContext = GrProtected::kNo;
-
+        d3dDevice->adapter = adapter;
         d3dDevice->device = device;
         d3dDevice->queue = queue;
         d3dDevice->hWnd = hWnd;
@@ -946,49 +935,28 @@ extern "C"
         }
     }
 
-    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_makeDirectXContext(
-        JNIEnv *env, jobject renderer, jlong devicePtr, jlong preferredHeapBlockSize)
+    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_getDirectXDevice(
+        JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        GrD3DBackendContext backendContext = d3dDevice->backendContext;
-        if (preferredHeapBlockSize > 0) {
-            backendContext.fMemoryAllocator = SkikoD3DMemoryAllocator::Make(
-                backendContext.fAdapter.get(), backendContext.fDevice.get(),
-                static_cast<UINT64>(preferredHeapBlockSize));
-            if (!backendContext.fMemoryAllocator) {
-                throwJavaRenderExceptionWithMessage(env, __FUNCTION__, "Could not create Direct3D memory allocator.");
-                return 0;
-            }
-        }
-        return toJavaPointer(GrDirectContexts::MakeD3D(backendContext).release());
+        return toJavaPointer(d3dDevice->device.Get());
     }
 
-    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_makeDirectXSurface(
-        JNIEnv *env, jobject renderer, jlong devicePtr, jlong contextPtr, jint width, jint height, jintArray surfacePropsInts, jint index)
+    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_getDirectXCommandQueue(
+        JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        GrDirectContext *context = fromJavaPointer<GrDirectContext *>(contextPtr);
-        GrD3DTextureResourceInfo info(nullptr,
-                                      nullptr,
-                                      D3D12_RESOURCE_STATE_PRESENT,
-                                      DXGI_FORMAT_R8G8B8A8_UNORM,
-                                      1,
-                                      1,
-                                      0);
-        d3dDevice->swapChain->GetBuffer(index, IID_PPV_ARGS(&d3dDevice->buffers[index]));
+        return toJavaPointer(d3dDevice->queue.Get());
+    }
 
-        info.fResource = d3dDevice->buffers[index];
-
-        std::unique_ptr<SkSurfaceProps> surfaceProps = skija::SurfaceProps::toSkSurfaceProps(env, surfacePropsInts);
-        GrBackendTexture backendTexture = GrBackendTextures::MakeD3D(
-                                 (int)d3dDevice->buffers[index]->GetDesc().Width,
-                                 (int)d3dDevice->buffers[index]->GetDesc().Height,
-                                 info);
-        auto result = SkSurfaces::WrapBackendTexture(
-                                 context, backendTexture, kTopLeft_GrSurfaceOrigin, 0,
-                                 kRGBA_8888_SkColorType, SkColorSpace::MakeSRGB(), surfaceProps.get())
-                                 .release();
-        return toJavaPointer(result);
+    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_getDirectXBackBuffer(
+        JNIEnv *env, jobject renderer, jlong devicePtr, jint backBufferIndex)
+    {
+        DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
+        if (!d3dDevice->buffers[backBufferIndex]) {
+            d3dDevice->swapChain->GetBuffer(backBufferIndex, IID_PPV_ARGS(&d3dDevice->buffers[backBufferIndex]));
+        }
+        return toJavaPointer(d3dDevice->buffers[backBufferIndex].Get());
     }
 
     // A frame-latency waitable swap chain has to be waited before rendering every frame, including the first one.
@@ -1010,7 +978,7 @@ extern "C"
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (d3dDevice && d3dDevice->fence.get() != nullptr) {
+        if (d3dDevice && d3dDevice->fence.Get() != nullptr) {
             const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
             if (d3dDevice->fence->GetCompletedValue() < fenceValue) {
                 d3dDevice->fence->SetEventOnCompletion(fenceValue, d3dDevice->fenceEvent);
@@ -1027,9 +995,9 @@ extern "C"
         JNIEnv *env, jobject renderer, jlong devicePtr)
     {
         DirectXDevice *d3dDevice = fromJavaPointer<DirectXDevice *>(devicePtr);
-        if (d3dDevice && d3dDevice->fence.get() != nullptr) {
+        if (d3dDevice && d3dDevice->fence.Get() != nullptr) {
             const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
-            d3dDevice->queue->Signal(d3dDevice->fence.get(), fenceValue);
+            d3dDevice->queue->Signal(d3dDevice->fence.Get(), fenceValue);
         }
     }
 
@@ -1053,7 +1021,7 @@ extern "C"
                     d3dDevice->fence->SetEventOnCompletion(d3dDevice->fenceValues[i], d3dDevice->fenceEvent);
                     WaitForSingleObjectEx(d3dDevice->fenceEvent, INFINITE, FALSE);
                 }
-                d3dDevice->buffers[i].reset(nullptr);
+                d3dDevice->buffers[i].Reset();
             }
             d3dDevice->swapChain->ResizeBuffers(
                 BuffersCount,
@@ -1078,7 +1046,7 @@ extern "C"
             // 1 value in [Present(1, 0)] enables vblank wait so this is how vertical sync works in DirectX.
             const UINT64 fenceValue = d3dDevice->fenceValues[d3dDevice->bufferIndex];
             d3dDevice->swapChain->Present((int)isVsyncEnabled, 0);
-            d3dDevice->queue->Signal(d3dDevice->fence.get(), fenceValue);
+            d3dDevice->queue->Signal(d3dDevice->fence.Get(), fenceValue);
         }
         __except(EXCEPTION_EXECUTE_HANDLER) {
             auto code = GetExceptionCode();

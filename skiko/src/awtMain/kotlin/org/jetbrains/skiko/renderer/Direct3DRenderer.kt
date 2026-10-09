@@ -2,10 +2,9 @@ package org.jetbrains.skiko.renderer
 
 import kotlinx.coroutines.withContext
 import org.jetbrains.skia.*
-import org.jetbrains.skia.impl.InteropPointer
 import org.jetbrains.skia.impl.getPtr
-import org.jetbrains.skia.impl.interopScope
 import org.jetbrains.skiko.*
+import org.jetbrains.skiko.graphicapi.DxgiFormat
 import java.awt.Container
 import java.awt.Dimension
 import java.awt.Window
@@ -38,11 +37,12 @@ internal class Direct3DRenderer(
             return field
         }
 
+    private var adapter = 0L
     val adapterName: String
     val adapterMemorySize: Long
 
     init {
-        val adapter = chooseAdapter(properties.adapterPriority.ordinal)
+        adapter = chooseAdapter(properties.adapterPriority.ordinal)
         if (adapter == 0L) {
             throw RenderException("Failed to choose DirectX12 adapter.")
         }
@@ -84,6 +84,7 @@ internal class Direct3DRenderer(
 
     private var context: DirectContext? = null
     private val bufferCount = 2
+    private val renderTargets: Array<BackendRenderTarget?> = arrayOfNulls(bufferCount)
     private val surfaces: Array<Surface?> = arrayOfNulls(bufferCount)
     private var surface: Surface? = null
     private var canvas: Canvas? = null
@@ -167,7 +168,22 @@ internal class Direct3DRenderer(
     private fun ensureContext(): Boolean {
         if (context == null) {
             try {
-                val newContext = DirectContext(makeDirectXContext(device, resourceHeapBlockSize))
+                val newContext = if (resourceHeapBlockSize == 0L) {
+                    DirectContext.makeDirect3D(
+                        adapter,
+                        getDirectXDevice(device),
+                        getDirectXCommandQueue(device)
+                    )
+                } else {
+                    DirectContext(
+                        makeDirectXContext(
+                            adapter,
+                            getDirectXDevice(device),
+                            getDirectXCommandQueue(device),
+                            resourceHeapBlockSize
+                        )
+                    )
+                }
                 context = newContext
                 onContextInitialized(newContext, layer.properties.gpuResourceCacheLimit) { renderInfo }
             } catch (e: Exception) {
@@ -192,26 +208,33 @@ internal class Direct3DRenderer(
             context.flush()
 
             val justInitialized = changeSize(width, height)
-            try {
-                val surfaceProps = SurfaceProps(pixelGeometry = pixelGeometry)
-                for (bufferIndex in 0 until bufferCount) {
-                    surfaces[bufferIndex] = makeSurface(
-                        context = getPtr(context),
-                        width = width,
-                        height = height,
-                        surfaceProps = surfaceProps,
-                        index = bufferIndex
-                    )
-                }
-            } finally {
-                Reference.reachabilityFence(context)
+            val surfaceProps = SurfaceProps(pixelGeometry = pixelGeometry)
+            for (backBufferIndex in 0 until bufferCount) {
+                val renderTarget = BackendRenderTarget.makeDirect3D(
+                    width = width,
+                    height = height,
+                    texturePtr = getDirectXBackBuffer(device, backBufferIndex),
+                    format = DxgiFormat.R8G8B8A8_UNORM.value,
+                    sampleCnt = 1,
+                    levelCnt = 1
+                )
+                renderTargets[backBufferIndex] = renderTarget
+                surfaces[backBufferIndex] = Surface.makeFromBackendRenderTarget(
+                    context,
+                    renderTarget,
+                    SurfaceOrigin.TOP_LEFT,
+                    SurfaceColorFormat.RGBA_8888,
+                    ColorSpace.sRGB,
+                    surfaceProps
+                ) ?: throw RenderException("Cannot create surface")
             }
 
             if (justInitialized) {
                 initFence(device)
             }
         }
-        surface = surfaces[getBufferIndex(device)]
+        val backBufferIndex = getBufferIndex(device)
+        surface = surfaces[backBufferIndex]
         canvas = surface!!.canvas
     }
 
@@ -254,15 +277,11 @@ internal class Direct3DRenderer(
         for (bufferIndex in 0 until bufferCount) {
             surfaces[bufferIndex]?.close()
             surfaces[bufferIndex] = null
+            renderTargets[bufferIndex]?.close()
+            renderTargets[bufferIndex] = null
         }
         surface = null
         canvas = null
-    }
-
-    private fun makeSurface(context: Long, width: Int, height: Int, surfaceProps: SurfaceProps, index: Int): Surface {
-        return interopScope {
-            Surface(makeDirectXSurface(device, context, width, height, toInterop(surfaceProps.packToIntArray()), index))
-        }
     }
 
     private fun changeSize(width: Int, height: Int): Boolean {
@@ -425,8 +444,15 @@ internal class Direct3DRenderer(
         compositionTargetHandle: Long,
         transparency: Boolean
     ): Long
-    private external fun makeDirectXContext(device: Long, preferredHeapBlockSize: Long): Long
-    private external fun makeDirectXSurface(device: Long, context: Long, width: Int, height: Int, surfacePropsIntArray: InteropPointer, index: Int): Long
+    private external fun makeDirectXContext(
+        adapter: Long,
+        device: Long,
+        commandQueue: Long,
+        preferredHeapBlockSize: Long
+    ): Long
+    private external fun getDirectXDevice(device: Long): Long
+    private external fun getDirectXCommandQueue(device: Long): Long
+    private external fun getDirectXBackBuffer(device: Long, backBufferIndex: Int): Long
     private external fun resizeBuffers(device: Long, width: Int, height: Int)
     private external fun swap(device: Long, isVsyncEnabled: Boolean)
     private external fun disposeDevice(device: Long)

@@ -146,7 +146,7 @@ fun SkikoProjectContext.declareWasmTasks() {
                     "-s", "SUPPORT_LONGJMP=wasm",
                     // -O2 saves 800kB for the output file, and ~100kB for transferred size.
                     // -O3 breaks the exports in js/mjs files. skiko.wasm size is the same though
-                    "-O2"
+                    "-Os"
                 )
             )
 
@@ -230,14 +230,20 @@ fun SkikoProjectContext.declareWasmTasks() {
         flags.addAll(
             buildList {
                 add("-Oz") // set optimization level to compress (highest size reduction)
-                if (!skiko.isWasmBuildWithProfiling) {
+                if (skiko.isWasmBuildWithProfiling) {
+                    add("--debuginfo")
+                } else {
                     // strip debug info (including the names section)
                     // only do so if we are not building with profiling, as names are required for profiling
                     add("--strip-debug")
                 }
                 add("--converge") // Run passes to convergence, continuing while binary size decreases
                 add("--strip-producers") // strip the wasm producers section
-                add("--all-features") // enable all features (most of them are required because of compilation with emcc)
+                add("--enable-bulk-memory")
+                add("--enable-exception-handling")
+                add("--enable-nontrapping-float-to-int")
+                add("--enable-sign-ext")
+                add("--enable-threads")
             }
         )
     }

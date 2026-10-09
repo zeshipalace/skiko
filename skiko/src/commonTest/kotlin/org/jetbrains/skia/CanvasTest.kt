@@ -53,6 +53,44 @@ class CanvasTest {
     }
 
     @Test
+    fun surfaceReturnsNullForBitmapCanvas() {
+        val bitmap = Bitmap().apply { allocPixels(ImageInfo.makeN32Premul(8, 8)) }
+
+        assertNull(Canvas(bitmap).surface)
+    }
+
+    @Test
+    fun surfaceIsBorrowedForRasterSurfaceCanvas() {
+        Surface.makeRasterN32Premul(8, 8).use { surface ->
+            val canvasSurface = surface.canvas.surface
+            assertNotNull(canvasSurface)
+            assertEquals(surface, canvasSurface)
+            assertFails { canvasSurface.close() }
+        }
+    }
+
+    @Test
+    fun surfaceOfRenderTargetCanvasCarriesItsContext() {
+        if (!TestGlContext.isAvailable()) return
+
+        if (hostOs == OS.Linux && kotlinBackend == KotlinBackend.Native && hostArch == Arch.Arm64) {
+            // TODO: fix test on Linux arm64 using EGL
+            return
+        }
+
+        TestGlContext.run {
+            DirectContext.makeGL().useContext { ctx ->
+                val imageInfo = ImageInfo.makeN32Premul(16, 16)
+                val surface = Surface.makeRenderTarget(ctx, budgeted = false, imageInfo)
+                val canvasSurface = surface.canvas.surface
+                assertNotNull(canvasSurface)
+                assertEquals(surface, canvasSurface)
+                assertEquals(ctx, canvasSurface._context)
+            }
+        }
+    }
+
+    @Test
     fun drawVertices() {
         val surface = Surface.makeRasterN32Premul(8, 8)
 
@@ -231,6 +269,22 @@ class CanvasTest {
         assertContentSame(expected = expected, got = surface.makeImageSnapshot(), sensitivity = 0.25)
     }
 
+    @Test
+    fun testLocalClipBounds() = runTest {
+        val surface = Surface.makeRasterN32Premul(8, 8)
+        surface.canvas.scale(2f, 2f)
+        surface.canvas.clipRect(1f, 1f, 3f, 3f, true)
+
+        assertEquals(Rect(0.5f, 0.5f, 3.5f, 3.5f), surface.canvas.localClipBounds)
+    }
+
+    @Test
+    fun testEmptyLocalClipBounds() = runTest {
+        val surface = Surface.makeRasterN32Premul(4, 4)
+        surface.canvas.clipRect(8f, 8f, 12f, 12f, true)
+
+        assertEquals(Rect(0f, 0f, 0f, 0f), surface.canvas.localClipBounds)
+    }
 
     @Test
     fun testTranslate() {

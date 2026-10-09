@@ -4,10 +4,10 @@
 
 ## 分支与版本
 
-- 维护分支:`voxzen`,已合并上游 `master` 至 `2756625dc`(包含 AWT frame-driving extraction #1273 与 stubs.cc 移除 #1285),使用 Skia `m152-2ca5fe6a81`
-- 版本号:`skiko/gradle.properties` 的 `deploy.version`,规则 `0.152.0-voxzen.N`;主版本跟随 Skia milestone,N 为 Voxzen 发布序号
+- 维护分支:`voxzen`,已合并上游 `master` 至 `8f09bee48`(2026-10-09),使用 Skia `m155-3945378c4a` 与 Kotlin `2.4.20`
+- 版本号:`skiko/gradle.properties` 的 `deploy.version`,当前为 `0.155.0-voxzen.1`,规则 `0.155.0-voxzen.N`;主版本跟随 Skia milestone,N 为 Voxzen 发布序号
 - 补丁栈(在基点之上):
-  - cherry-pick 上游 PR [#1282](https://github.com/JetBrains/skiko/pull/1282)(SkiaSwingLayer frame pacing,`skiko.swing.frame.pacing`);`SkikoProperties.kt` 已适配上游 lazy 属性风格
+  - Swing frame pacing 已采用上游正式合入的 PR [#1282](https://github.com/JetBrains/skiko/pull/1282),替换此前 cherry-pick 的草案实现,仍通过 `skiko.swing.frame.pacing` 启用
   - Linux GLX 上下文按窗口实际 Visual 创建(voxzen.2):`renderer.cc` 的 `createContext` 新增 window 参数,先 `XGetWindowAttributes` 取窗口 Visual,再在 `glXGetFBConfigs` 中按 `GLX_VISUAL_ID` 匹配 FBConfig 用 `glXCreateNewContext` 建上下文;失败回退原 `glXChooseVisual` 路径。修复 KDE Wayland(XWayland)下 OpenGL 透明窗口全透明(CMP-6639;`glXChooseVisual` 选到 24 位 Visual 而 AWT 透明窗口用 32 位 ARGB,`glXMakeCurrent` 不报错但 alpha 通道全 0)
   - Windows Direct3D 同步缩放兼容透明合成(voxzen.2):透明层继续为 `CreateSwapChainForComposition` 使用其强制要求的 `DXGI_SCALING_STRETCH`,避免 `DXGI_SCALING_NONE` 创建失败后回退到不透明 HWND 交换链,保留 Acrylic/Mica 等 DWM 背景材质
   - Windows Direct3D 自定义客户区同步缩放(voxzen.3):当窗口客户区覆盖整个原生窗口时,在调用下层 AWT 窗口过程前保留 `WM_NCCALCSIZE` 的完整候选尺寸,防止 AWT 按系统标题栏/边框扣减后让实时帧和内容子窗口少画右侧、底部区域
@@ -29,13 +29,25 @@
 
 ### CMP 兼容性
 
-当前分支已进入 master(0.152.x 线),与 CMP 1.12.0 **二进制不兼容**,实测:
+当前分支跟随 master(0.155.x 线);此前 0.152.x 同步时已实测与 CMP 1.12.0 **二进制不兼容**:
 
 - `org.jetbrains.skia.FontMetrics`、`FontStyle` 等已改为 Kotlin value class,实例方法全部变成名称混淆的静态 `-impl` 方法(如 `getAscent-impl([F)`),CMP 1.12.0 的 ui-text/ui-graphics 编译期绑定旧签名 → 运行时 `NoSuchMethodError`,且无法用 shim 桥接(擦除签名完全不同)
 - `RenderNodeContext.<init>(Z)V` 变为 `(ZZ)V`
 - master 还包含 AWT 渲染栈重构(#1234、#1273)与 Skia m150→m152 升级
 
 因此 Voxzen 应同时升级到基于 skiko ≥ 0.152 的 CMP 版本,不能把当前产物与 CMP 1.12.0 混用。
+
+### 0.155.0-voxzen.1 上游同步
+
+本次合入 36 个上游提交,包含 Vulkan 绑定、Canvas surface/localClipBounds、RenderNode 更新优化以及 AWT Ganesh 对象创建重构。Linux GLX Visual、多窗口并行 vsync、mediamp 反射契约,Windows 同步缩放、Snap、缓存回收与堆块配置,以及 macOS 缩放帧合并补丁继续保留
+
+Kotlin 2.4.20 的默认模块名改变了 internal getter 的 JVM 名称,因此兼容 getter 用 `@get:JvmName` 固定为 `getRedrawer$skiko`,并通过反射测试校验它与 `access$makeCurrent` 的入口签名
+
+Direct3D 默认上下文和 render target 使用上游 Kotlin 绑定;非默认堆块配置与帧边界回收继续使用私有 JNI,其 Ganesh 实现在 `direct3DContext.cc`。已核对 Skia m155 的 `DEPS`,D3D12MemoryAllocator 仍为 `169895d529dfce00390a20e69c2f516066fe7a3b`,无需替换 vendor 头文件
+
+核心 jar 与 native runtime 需要成套升级。本次同步不更新 Voxzen 消费端依赖,跨平台窗口行为和消费端 CMP 兼容性需要在对应环境单独验收
+
+Linux/JBR 25 验证:AWT 主代码与测试编译通过,Linux native 核心及扩展构建通过;核心 AWT 回归 396 项通过、48 项跳过,Skottie 8 项和 Graphite 1 项通过。核心回归在独立 KWin/XWayland 中关闭屏幕断言(`skiko.test.ui.enabled=false`)并启用定时帧时钟(`skiko.swing.frame.pacing.forceTimer=true`);首次窗口测试出现 Robot 截图全黑与显示时钟超时,因此不代表窗口像素或真实 vblank 验收通过。Windows/macOS 原生构建及窗口行为尚未验证
 
 ## 本地迭代(开发机)
 

@@ -7,11 +7,38 @@
 
 #include "ganesh/GrBackendSurface.h"
 #include "ganesh/GrDirectContext.h"
+#include "ganesh/d3d/GrD3DBackendContext.h"
+#include "ganesh/d3d/GrD3DDirectContext.h"
+#include "direct3DMemoryAllocator.h"
 #include "SkSurface.h"
 #include "exceptions_handler.h"
 
 extern "C"
 {
+    JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_makeDirectXContext(
+        JNIEnv *env,
+        jobject renderer,
+        jlong adapterPtr,
+        jlong devicePtr,
+        jlong commandQueuePtr,
+        jlong preferredHeapBlockSize)
+    {
+        GrD3DBackendContext backendContext = {};
+        backendContext.fAdapter.retain(fromJavaPointer<IDXGIAdapter1 *>(adapterPtr));
+        backendContext.fDevice.retain(fromJavaPointer<ID3D12Device *>(devicePtr));
+        backendContext.fQueue.retain(fromJavaPointer<ID3D12CommandQueue *>(commandQueuePtr));
+        backendContext.fProtectedContext = GrProtected::kNo;
+        backendContext.fMemoryAllocator = SkikoD3DMemoryAllocator::Make(
+            backendContext.fAdapter.get(),
+            backendContext.fDevice.get(),
+            static_cast<UINT64>(preferredHeapBlockSize));
+        if (!backendContext.fMemoryAllocator) {
+            throwJavaRenderExceptionWithMessage(env, __FUNCTION__, "Could not create Direct3D memory allocator.");
+            return 0;
+        }
+        return toJavaPointer(GrDirectContexts::MakeD3D(backendContext).release());
+    }
+
     JNIEXPORT jlong JNICALL Java_org_jetbrains_skiko_renderer_Direct3DRenderer_resourceCacheFrameStart(
         JNIEnv *, jobject)
     {

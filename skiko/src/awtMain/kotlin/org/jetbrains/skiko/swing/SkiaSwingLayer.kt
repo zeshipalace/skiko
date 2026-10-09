@@ -131,8 +131,9 @@ open class SkiaSwingLayer(
      */
     fun needRender() {
         check(isEventDispatchThread()) { "Method should be called from AWT event dispatch thread" }
+        if (isDisposed) return
         val repaintPacer = repaintPacer
-        if (repaintPacer != null && !isDisposed) {
+        if (repaintPacer != null) {
             repaintPacer.requestRepaint()
         } else {
             repaint()

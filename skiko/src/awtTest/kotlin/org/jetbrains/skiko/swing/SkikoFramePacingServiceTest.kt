@@ -36,10 +36,20 @@ class SkikoFramePacingServiceTest {
         return displayId
     }
 
+    /**
+     * The default display, skipping the test where it is deliberately not paced: a virtual CI
+     * screen (Xvfb) reports no refresh rate, and without DRM access there is then no clock for it.
+     */
+    private fun paceableDisplayId(service: FramePacingService): Long {
+        val displayId = defaultDisplayId(service)
+        assumeTrue("the default display reports no refresh rate", service.refreshPeriodNanos(displayId) > 0)
+        return displayId
+    }
+
     @Test
     fun `subscription receives ticks at roughly the display rate`() {
         val service = headfulService()
-        val displayId = defaultDisplayId(service)
+        val displayId = paceableDisplayId(service)
         Library.load()
 
         val ticks = AtomicLong()
@@ -68,7 +78,7 @@ class SkikoFramePacingServiceTest {
     @Test
     fun `closing the subscription stops the ticks`() {
         val service = headfulService()
-        val displayId = defaultDisplayId(service)
+        val displayId = paceableDisplayId(service)
         Library.load()
 
         val ticks = AtomicLong()
@@ -85,16 +95,26 @@ class SkikoFramePacingServiceTest {
         val after = ticks.get()
         Thread.sleep(300)
         assertEquals(after, ticks.get(), "ticks kept arriving after close()")
+
+        // The clock thread owns its native source and exits on its own once the clock stops;
+        // nothing joins it, so its disappearance is the only proof the source was released.
+        awaitCondition("clock thread still alive after close()") {
+            Thread.getAllStackTraces().keys.none { it.name.startsWith("Skiko-FramePacing-") }
+        }
     }
 
     @Test
-    fun `a throwing listener does not starve its sibling`() {
+    fun `a throwing listener is dropped and does not starve its sibling`() {
         val service = headfulService()
-        val displayId = defaultDisplayId(service)
+        val displayId = paceableDisplayId(service)
         Library.load()
 
+        val throwCount = AtomicLong()
         val siblingTicks = CountDownLatch(10)
-        val throwing = service.subscribe(displayId) { _, _ -> error("deliberate test exception") }
+        val throwing = service.subscribe(displayId) { _, _ ->
+            throwCount.incrementAndGet()
+            error("deliberate test exception")
+        }
         val sibling = service.subscribe(displayId) { _, _ -> siblingTicks.countDown() }
         assertNotNull(throwing)
         assertNotNull(sibling)
@@ -104,16 +124,23 @@ class SkikoFramePacingServiceTest {
                 siblingTicks.await(5, TimeUnit.SECONDS),
                 "sibling listener starved by a throwing listener"
             )
+            assertEquals(
+                1,
+                throwCount.get(),
+                "throwing listener should have been dropped after the first exception"
+            )
         } finally {
-            throwing.close()
+            // Close the healthy sibling first: that is the order that would double-stop the clock
+            // if dropping a throwing listener from deliver() were not teardown-idempotent.
             sibling.close()
+            throwing.close()
         }
     }
 
     @Test
     fun `two subscriptions share one clock and survive each other`() {
         val service = headfulService()
-        val displayId = defaultDisplayId(service)
+        val displayId = paceableDisplayId(service)
         Library.load()
 
         val firstTicks = AtomicLong()
@@ -159,12 +186,14 @@ class SkikoFramePacingServiceTest {
     @Test
     fun `native display clock is used on macOS`() {
         assumeTrue(hostOs == OS.MacOS)
+        // NSScreen.displayLink is macOS 14+; older systems get the timer, by design.
+        assumeTrue(System.getProperty("os.version").substringBefore('.').toInt() >= 14)
         val service = headfulService()
         val displayId = defaultDisplayId(service)
         Library.load()
 
-        // The exploration's point on macOS is DISPLAY_LINK-grade ticks: the probe must accept
-        // the default display, so the clock created for it is the CADisplayLink one.
+        // The probe must accept the default display, so the clock created for it is the
+        // CADisplayLink one.
         assertTrue(
             MacDisplayLinkClock.available(displayId),
             "display-link probe refused the default display"
@@ -172,18 +201,22 @@ class SkikoFramePacingServiceTest {
     }
 
     @Test
-    fun `native vblank clock is used on Windows`() {
+    fun `vblank clock ticks on Windows`() {
         assumeTrue(hostOs == OS.Windows)
-        headfulService()
+        val service = headfulService()
+        val displayId = defaultDisplayId(service)
         Library.load()
 
-        // The exploration's point on Windows is per-display vblank ticks: with a desktop
-        // session and an attached output, DXGI must be usable, so the clock created is the
-        // WaitForVBlank one (not the DWM or timer fallback).
-        assertTrue(
-            WinNativeClock.vblankAvailable(),
-            "DXGI vblank probe found no desktop-attached output"
-        )
+        // Windows has no stand-in clock: a desktop session gets the DXGI vblank or nothing, so
+        // ticks arriving here prove the vblank path itself.
+        val ticks = AtomicLong()
+        val subscription = service.subscribe(displayId) { _, _ -> ticks.incrementAndGet() }
+        assertNotNull(subscription, "subscribe must succeed for the default display")
+        try {
+            awaitTicks(ticks)
+        } finally {
+            subscription.close()
+        }
     }
 
     @Test
@@ -192,19 +225,22 @@ class SkikoFramePacingServiceTest {
         headfulService()
         Library.load()
 
-        // The exploration's point on Linux is kernel-vblank ticks: a local desktop session
-        // has DRM device access via the logind seat ACL, so the probe must find an active
-        // CRTC and the clock created is the DRM vblank one (not the timer).
-        assertTrue(
-            LinuxDrmVBlankClock.available(),
-            "DRM vblank probe found no accessible active CRTC"
+        // The exploration's point on Linux is kernel-vblank ticks: a real seat with DRM device access must
+        // get them, not the timer. But a headful X11 session is not proof of one — CI's xvfb desktop runs
+        // against a software renderer with no DRM nodes the runner may use, and there the service is
+        // *supposed* to fall back to the timer — so the probe runs everywhere (it still fails the test if
+        // the native path is broken) but only asserts where it can pass. This mirrors the guard in
+        // `an available native backend is used instead of the timer`.
+        assumeTrue(
+            "DRM vblank probe found no accessible active CRTC: not a DRM-backed seat",
+            LinuxDrmVBlankClock.available()
         )
     }
 
     @Test
     fun `the clock is recreated after the last subscription closes`() {
         val service = headfulService()
-        val displayId = defaultDisplayId(service)
+        val displayId = paceableDisplayId(service)
         Library.load()
 
         val firstTicks = AtomicLong()
@@ -226,6 +262,52 @@ class SkikoFramePacingServiceTest {
     }
 
     @Test
+    fun `a new subscriber does not share a clock whose thread has ended`() {
+        assumeFalse(GraphicsEnvironment.getLocalGraphicsEnvironment().isHeadlessInstance)
+        // The first clock cannot open its source, so its thread ends at once; every later one ticks.
+        val created = mutableListOf<DisplayClock>()
+        val service = SkikoFramePacingService { id, period ->
+            val clock = if (created.isEmpty()) UnopenableClock(id, period) else TimerClock(id, PLAUSIBLE_PERIOD_NANOS)
+            clock.also { created += it }
+        }
+        val displayId = defaultDisplayId(service)
+
+        // An idle sibling keeps the dead clock registered, as a pacer does for its idle-release delay.
+        val idle = assertNotNull(service.subscribe(displayId) { _, _ -> })
+        awaitCondition("the unopenable clock never ended") { created.single().ended }
+
+        val ticks = AtomicLong()
+        val active = assertNotNull(service.subscribe(displayId) { _, _ -> ticks.incrementAndGet() })
+        try {
+            assertEquals(2, created.size, "the dead clock was shared with a new subscriber")
+            awaitTicks(ticks)
+        } finally {
+            active.close()
+            idle.close()
+        }
+    }
+
+    @Test
+    fun `a clock made for another refresh rate is not shared`() {
+        assumeFalse(GraphicsEnvironment.getLocalGraphicsEnvironment().isHeadlessInstance)
+        // Every clock claims a period the display does not have, as one does after a mode change.
+        val created = mutableListOf<DisplayClock>()
+        val service = SkikoFramePacingService { id, period ->
+            TimerClock(id, period + PLAUSIBLE_PERIOD_NANOS).also { created += it }
+        }
+        val displayId = defaultDisplayId(service)
+
+        val first = assertNotNull(service.subscribe(displayId) { _, _ -> })
+        val second = assertNotNull(service.subscribe(displayId) { _, _ -> })
+        try {
+            assertEquals(2, created.size, "a clock built for another rate was shared")
+        } finally {
+            second.close()
+            first.close()
+        }
+    }
+
+    @Test
     fun `an available native backend is used instead of the timer`() {
         val service = headfulService()
         val displayId = defaultDisplayId(service)
@@ -235,12 +317,12 @@ class SkikoFramePacingServiceTest {
         // The probe passing is not the same thing as the platform branch being wired to it: an
         // unconditional TimerClock would still tick at roughly the right rate and pass every other
         // test in this file.
-        val clock = SkikoFramePacingService.createClock(
-            displayId, PLAUSIBLE_PERIOD_NANOS, PLAUSIBLE_PERIOD_NANOS, forceTimer = false
+        val clock = assertNotNull(
+            SkikoFramePacingService.createClock(displayId, PLAUSIBLE_PERIOD_NANOS, forceTimer = false)
         )
         val expected = when (hostOs) {
             OS.MacOS -> MacDisplayLinkClock::class
-            OS.Windows -> WinNativeClock::class
+            OS.Windows -> WinVBlankClock::class
             OS.Linux -> LinuxDrmVBlankClock::class
             else -> error("unreachable: nativeBackendAvailable is false on $hostOs")
         }
@@ -253,10 +335,28 @@ class SkikoFramePacingServiceTest {
         val displayId = defaultDisplayId(service)
         Library.load()
 
-        val clock = SkikoFramePacingService.createClock(
-            displayId, PLAUSIBLE_PERIOD_NANOS, PLAUSIBLE_PERIOD_NANOS, forceTimer = true
+        val clock = assertNotNull(
+            SkikoFramePacingService.createClock(displayId, PLAUSIBLE_PERIOD_NANOS, forceTimer = true)
         )
         assertEquals(TimerClock::class, clock::class, "the debug escape hatch did not force the timer")
+    }
+
+    @Test
+    fun `an unknown refresh rate disables the timer and the Linux clock, not the per-display sources`() {
+        val service = headfulService()
+        val displayId = defaultDisplayId(service)
+        Library.load()
+
+        // The timer needs a cadence, and the Linux clock matches its CRTC on the period; with no
+        // reported rate neither can be right, so the display is not paced. CADisplayLink and
+        // WaitForVBlank are bound to their display and need no rate at all.
+        assertNull(SkikoFramePacingService.createClock(displayId, 0, forceTimer = true), "a timer with no period")
+        val clock = SkikoFramePacingService.createClock(displayId, 0, forceTimer = false)
+        when (hostOs) {
+            OS.MacOS -> if (MacDisplayLinkClock.available(displayId)) assertNotNull(clock) else assertNull(clock)
+            OS.Windows -> assertNotNull(clock)
+            else -> assertNull(clock, "no period to match a CRTC on")
+        }
     }
 
     @Test
@@ -295,7 +395,7 @@ class SkikoFramePacingServiceTest {
 
     private fun nativeBackendAvailable(displayId: Long): Boolean = when (hostOs) {
         OS.MacOS -> MacDisplayLinkClock.available(displayId)
-        // Both Windows flavours are WinNativeClock, so that branch is taken either way.
+        // Windows has no stand-in clock, so the vblank branch is always the one taken.
         OS.Windows -> true
         OS.Linux -> LinuxDrmVBlankClock.available()
         else -> false
@@ -311,10 +411,24 @@ class SkikoFramePacingServiceTest {
         override fun getDefaultConfiguration(): GraphicsConfiguration? = null
     }
 
+    private class UnopenableClock(displayId: Long, periodNanos: Long) : NativeVBlankClock(displayId, periodNanos) {
+        override fun open(): Long = 0
+        override fun waitTick(handle: Long): Long = error("must not be called without a source")
+        override fun close(handle: Long) = Unit
+    }
+
     private fun awaitTicks(ticks: AtomicLong, moreThan: Long = 0) {
         val deadline = System.currentTimeMillis() + 5000
         while (ticks.get() <= moreThan) {
             assertTrue(System.currentTimeMillis() < deadline, "no ticks within 5s")
+            Thread.sleep(10)
+        }
+    }
+
+    private fun awaitCondition(message: String, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + 3000
+        while (!condition()) {
+            assertTrue(System.currentTimeMillis() < deadline, message)
             Thread.sleep(10)
         }
     }

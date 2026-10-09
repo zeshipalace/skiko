@@ -4,7 +4,8 @@
 [GPUOpen D3D12MemoryAllocator, commit 169895d529dfce00390a20e69c2f516066fe7a3b](https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator/blob/169895d529dfce00390a20e69c2f516066fe7a3b/src/D3D12MemAlloc.h).
 Its MIT license is included at the top of the header.
 
-This is the exact revision in JetBrains Skia `m152-2ca5fe6a81`'s `DEPS`.
+This is the exact revision in JetBrains Skia `m155-3945378c4a`'s `DEPS`,
+unchanged from `m152-2ca5fe6a81`.
 The implementation is already linked into the prebuilt Skia static library; we
 do **not** compile a second allocator. The release archive omits this declaration
 header, so Skiko carries it to configure the allocator via Ganesh's existing

@@ -72,6 +72,27 @@ open class Canvas internal constructor(ptr: NativePointer, managed: Boolean, int
             reachabilityBarrier(_owner)
         }
 
+    /**
+     * Returns the Surface this Canvas draws into.
+     *
+     * Canvases obtained from [Surface.canvas] return that surface. Canvases that draw into
+     * a [Bitmap], a [Picture] recording or a document return null.
+     *
+     * The returned surface is borrowed from the Canvas and must not be closed. It carries the
+     * canvas's [recordingContext], so [Surface.flush] and [Surface.flushAndSubmit] work on it.
+     *
+     * @return the Surface backing this Canvas, if any; null otherwise
+     */
+    val surface: Surface?
+        get() = try {
+            Stats.onNativeCall()
+            val ptr = _nGetCanvasSurface(_ptr)
+            if (ptr == NullPointer) null else Surface(ptr, recordingContext, managed = false)
+        } finally {
+            reachabilityBarrier(this)
+            reachabilityBarrier(_owner)
+        }
+
     fun drawPoint(x: Float, y: Float, paint: Paint): Canvas {
         Stats.onNativeCall()
         try {
@@ -1277,6 +1298,22 @@ open class Canvas internal constructor(ptr: NativePointer, managed: Boolean, int
         return clipRegion(r, ClipMode.INTERSECT)
     }
 
+    /**
+     * Returns bounds of clip in local coordinates.
+     *
+     * The returned [Rect] is outset by one device pixel to account for partial pixel coverage
+     * in case the clip is anti-aliased.
+     *
+     * If the clip is empty, returns an empty [Rect].
+     */
+    val localClipBounds: Rect
+        get() = try {
+            Stats.onNativeCall()
+            Rect.fromInteropPointer { _nGetLocalClipBounds(_ptr, it) }
+        } finally {
+            reachabilityBarrier(this)
+        }
+
     fun translate(dx: Float, dy: Float): Canvas {
         interopScope {
             Stats.onNativeCall()
@@ -1639,6 +1676,9 @@ private external fun _nMakeFromBitmap(bitmapPtr: NativePointer, flags: Int, pixe
 @ExternalSymbolName("org_jetbrains_skia_Canvas__1nGetRecordingContext")
 private external fun _nGetCanvasRecordingContext(ptr: NativePointer): NativePointer
 
+@ExternalSymbolName("org_jetbrains_skia_Canvas__1nGetSurface")
+private external fun _nGetCanvasSurface(ptr: NativePointer): NativePointer
+
 @ExternalSymbolName("org_jetbrains_skia_Canvas__1nDrawPoint")
 private external fun _nDrawPoint(ptr: NativePointer, x: Float, y: Float, paintPtr: NativePointer)
 
@@ -1833,6 +1873,9 @@ private external fun _nClipPath(ptr: NativePointer, nativePath: NativePointer, m
 
 @ExternalSymbolName("org_jetbrains_skia_Canvas__1nClipRegion")
 private external fun _nClipRegion(ptr: NativePointer, nativeRegion: NativePointer, mode: Int)
+
+@ExternalSymbolName("org_jetbrains_skia_Canvas__1nGetLocalClipBounds")
+private external fun _nGetLocalClipBounds(ptr: NativePointer, rectPtr: InteropPointer)
 
 @ExternalSymbolName("org_jetbrains_skia_Canvas__1nTranslate")
 private external fun _nTranslate(ptr: NativePointer, dx: Float, dy: Float)

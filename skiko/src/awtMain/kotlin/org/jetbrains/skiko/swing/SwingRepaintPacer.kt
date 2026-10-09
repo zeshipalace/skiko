@@ -1,97 +1,72 @@
 package org.jetbrains.skiko.swing
 
-import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeout
 import org.jetbrains.skiko.FrameDispatcher
 import org.jetbrains.skiko.MainUIDispatcher
-import org.jetbrains.skiko.swing.SwingRepaintPacer.Companion.TICK_TIMEOUT_PERIODS
 import java.awt.Component
 import java.awt.GraphicsConfiguration
-import java.util.concurrent.atomic.AtomicReference
 import javax.swing.Timer
-import kotlin.coroutines.resume
 import kotlin.math.ceil
 
 /**
- * Paces invalidation-driven repaints of a Swing component to the display refresh, using Skiko's own display clocks
- * ([SkikoFramePacingService]), so it works on any JVM.
+ * Paces the repaints a component requests through [requestRepaint] to its display's refresh rate.
  *
- * Without pacing, a continuously invalidating scene (e.g., a draw-phase animation) calls [Component.repaint] as fast as
- * the EDT can complete paint cycles, rendering far above the display refresh rate and burning GPU on frames that are
- * never shown.
+ * A requested frame is repainted at once — a frame that is already wanted never waits for vsync — and the next one
+ * is held until the display's next refresh tick. A continuous stream of requests is therefore repainted at most
+ * once per tick, while a request that arrives when nothing is pending paints with no added latency.
  *
- * The pacer runs a [FrameDispatcher] frame loop on the EDT, in the same shape as the redrawers' frame schedulers: a
- * requested frame is repainted immediately — a frame that is already wanted should never wait for vsync — and the
- * loop then suspends in [awaitTickIfPaced] until the next FramePacing tick before it repaints again. So pacing only
- * throttles a continuous stream of requests (to at most one repaint per tick), while a request arriving when the loop
- * is idle paints with no added latency.
- *
- * Behavior:
- * - If no pacing clock is available, or the component's display cannot be paced, requests degrade to unpaced
+ * - If no pacing clock is available, or the component's display cannot be paced, requests fall through to plain
  *   [Component.repaint]s.
- * - The display id is re-resolved from the component's current [java.awt.GraphicsConfiguration] once per frame, and the
- *   tick subscription is re-created when it changes, comparing the display id per frame rather than listening to
- *   component hierarchy or property events.
- * - A display that refuses a subscription, or that accepts one and then never ticks, is remembered and not retried
- *   until the component moves to a different display, so an unpaceable display does not cost a subscription attempt
- *   per frame.
- * - The subscription is dropped once the component stops requesting frames, so an idle component does not hold a
- *   running display clock; the next request re-creates it, without added latency.
- * - The tick wait is bounded by [withTimeout], so a dead pacing clock can never stall the frame loop: see
- *   [awaitTickIfPaced].
+ * - The display is re-resolved from the component's [GraphicsConfiguration] on every frame, and the tick
+ *   subscription follows it. It also follows a change of refresh rate on the same display, checked about once
+ *   a second.
+ * - A display that refuses a subscription, or accepts one and then never ticks, is not retried until the component
+ *   moves to another display.
+ * - The subscription is released once the component stops requesting frames, so an idle component does not keep a
+ *   display clock running.
+ * - A wait for a tick is bounded, so a clock that stops ticking cannot stall the frame loop.
  *
- * Note: this only gates the [Component.repaint] path. Paints initiated by Swing itself — resize, expose,
- * `paintImmediately` — are not affected.
+ * Only repaints requested through this class are paced. Paints Swing starts itself — on resize, expose,
+ * `paintImmediately` — are not.
  *
  * [requestRepaint] and [dispose] must be called on the event dispatch thread.
  */
 internal class SwingRepaintPacer(
     private val component: Component,
-    private val service: FramePacingService? = FramePacingServices.default
+    private val service: FramePacingService? = SkikoFramePacingService.instance,
+    private val periodCheckIntervalNanos: Long = PERIOD_CHECK_INTERVAL_NANOS
 ) {
     private var disposed = false
 
     private var subscription: AutoCloseable? = null
     private var subscribedDisplayId = UNKNOWN_DISPLAY_ID
+    private var subscribedPeriodNanos = 0L
+    private var nextPeriodCheckNanos = 0L
 
-    /**
-     * The display that most recently refused a subscription, or accepted one and then never ticked; frames are not
-     * paced while on it. Kept so that an unpaceable display does not cost a subscription attempt on every frame;
-     * cleared when the component moves to another display, or when a tick timeout suggests the stall was transient.
-     */
+    /** The display that most recently refused a subscription or never ticked; not retried until the component moves. */
     private var failedDisplayId = UNKNOWN_DISPLAY_ID
 
-    /**
-     * ~[TICK_TIMEOUT_PERIODS] refresh periods of the subscribed display, never below
-     * [MIN_TICK_TIMEOUT_MILLIS].
-     */
     private var tickTimeoutMillis = DEFAULT_TICK_TIMEOUT_MILLIS
 
-    /**
-     * Whether the current subscription has delivered at least one tick. Written from the tick thread, read on the EDT
-     * when a wait times out, to tell a clock that stalled from one that never started.
-     */
-    @Volatile
+    /** Whether the current subscription has delivered a tick; tells a clock that stalled from one that never started. */
     private var receivedTick = false
 
     /**
-     * Set on the EDT while the frame loop waits for a tick; resumed from the tick thread.
+     * Ticks reach the frame loop through a rendezvous: [Channel.trySend] succeeds only while the loop is suspended
+     * in [Channel.receive], so a tick from before a wait started can never satisfy it. Each tick carries the
+     * generation of the subscription that produced it, because a closed subscription can still deliver one tick
+     * that was already in flight; a wait accepts only ticks of the current generation. Never closed, so a tick
+     * arriving after [closeSubscription] is dropped rather than thrown.
      */
-    private val tickContinuation = AtomicReference<CancellableContinuation<Unit>?>(null)
+    private val tickChannel = Channel<Long>(Channel.RENDEZVOUS)
+    private var subscriptionGeneration = 0L
 
     /**
-     * Drops the subscription once the component has stopped asking for frames.
-     *
-     * A subscription costs a running clock — a native thread in a vblank wait, and a callback into the JVM on every
-     * refresh — so keeping one alive for the whole lifetime of a component that painted once works against the point
-     * of pacing. The delay is what stops that from becoming churn: a component that invalidates in bursts (a blinking
-     * caret) keeps its subscription between bursts, and only a genuinely idle one gives the clock up. Re-subscribing
-     * costs nothing in latency, because a request arriving while the loop is idle paints before it waits.
-     *
-     * Restarted whenever a wait ends normally, and stopped before each wait, so it can never fire while the frame
-     * loop is suspended on a tick.
+     * Releases the subscription once the component has stopped requesting frames. The delay keeps a component that
+     * invalidates in bursts — a blinking caret — on one subscription; only a genuinely idle one gives the clock up.
+     * Stopped before every wait, so it can never fire while the loop is suspended on a tick.
      */
     private val idleTimer = Timer(IDLE_RELEASE_DELAY_MILLIS) { closeSubscription() }
         .apply { isRepeats = false }
@@ -103,10 +78,6 @@ internal class SwingRepaintPacer(
         }
     }
 
-    /**
-     * Requests a repaint of the component. If the frame loop is idle, the repaint is issued immediately; while pacing
-     * is active, a continuous stream of requests coalesces to at most one repaint per FramePacing tick.
-     */
     fun requestRepaint() {
         if (disposed || service == null) {
             component.repaint()
@@ -126,43 +97,31 @@ internal class SwingRepaintPacer(
     }
 
     /**
-     * Suspends until the next FramePacing tick, so that the frame just painted is the only one in this refresh
-     * interval. No-op when the display cannot be paced.
+     * Suspends until the display's next tick, so that the frame just painted is the only one in this refresh
+     * interval. Does nothing when the display cannot be paced.
      *
-     * The wait is bounded by [withTimeout] so that a dead pacing clock cannot stall the frame loop: a healthy clock
-     * always beats the deadline, so the timeout only fires when the clock is not delivering. The loop never owes a
-     * repaint at that point — the frame was already painted before the wait — so on timeout it stops waiting and
-     * drops the subscription.
-     *
-     * What happens next depends on whether that subscription ever ticked. A clock that ticked and then stopped hit a
-     * transient stall (display unplugged, mode change), so the next frame re-creates the subscription, retrying even
-     * a previously refused display. A clock that never ticked at all never started: the backend accepted the display
-     * and then stayed silent, which is what a native clock that failed to open its display source does. Re-creating
-     * that one on every timeout would rebuild a native clock forever and hold the scene to one repaint per timeout,
-     * which is slower than not pacing, so its display is remembered as unpaceable and retried only when the component
-     * moves to another display.
+     * When the wait times out the subscription is dropped; the frame was already painted, so nothing is owed. A
+     * clock that ticked before and then stopped is treated as a transient stall, and the next frame subscribes
+     * again. A clock that never ticked never started — a native source that could not be opened looks exactly like
+     * this — and re-subscribing on every timeout would rebuild it forever while holding the scene to one repaint per
+     * timeout. That display is instead remembered as unpaceable until the component moves.
      */
     private suspend fun awaitTickIfPaced() {
         val service = service ?: return
 
-        // The subscription must stay alive for as long as this wait: the idle timer would otherwise close it and
-        // leave the loop suspended until its own timeout.
         idleTimer.stop()
+        if (!ensureSubscription(service)) return
 
-        ensureSubscription(service)
-        if (subscription == null) return
-
+        // A fresh subscription's first tick also waits for the clock thread to start and the native source to
+        // open, which the per-period timeout does not cover.
+        val timeoutMillis = if (receivedTick) tickTimeoutMillis else maxOf(tickTimeoutMillis, FIRST_TICK_TIMEOUT_MILLIS)
         try {
-            withTimeout(tickTimeoutMillis) {
-                suspendCancellableCoroutine { continuation ->
-                    tickContinuation.set(continuation)
-                    continuation.invokeOnCancellation {
-                        tickContinuation.compareAndSet(continuation, null)
-                    }
+            withTimeout(timeoutMillis) {
+                while (tickChannel.receive() != subscriptionGeneration) {
+                    // A tick from a subscription that has since been closed; keep waiting for the current one.
                 }
             }
-            // The tick arrived. If no further frame is requested, this is where the component went idle, so start
-            // counting down to giving the clock back.
+            receivedTick = true
             if (!disposed) idleTimer.restart()
         } catch (_: TimeoutCancellationException) {
             failedDisplayId = if (receivedTick) UNKNOWN_DISPLAY_ID else subscribedDisplayId
@@ -170,51 +129,46 @@ internal class SwingRepaintPacer(
         }
     }
 
-    /**
-     * The per-frame display check: re-resolves the component's display and re-creates the tick subscription if the
-     * display changed. If the display cannot be resolved or paced, any live subscription is closed — its ticks belong
-     * to a display the component is no longer on — and frames are not paced until the display can be resolved again.
-     */
-    private fun ensureSubscription(service: FramePacingService) {
+    /** Returns false when the display cannot be resolved or paced, i.e. when there is no subscription to wait on. */
+    private fun ensureSubscription(service: FramePacingService): Boolean {
         val displayId = resolveDisplayId(service)
         if (displayId == UNKNOWN_DISPLAY_ID || displayId == failedDisplayId) {
             closeSubscription()
-            return
+            return false
         }
 
-        if (subscription != null && displayId == subscribedDisplayId) return
+        if (subscription != null && displayId == subscribedDisplayId && !refreshRateChanged(service)) return true
 
         closeSubscription()
-        tickTimeoutMillis = tickTimeoutMillisFor(service.refreshPeriodNanos(displayId))
-
-        // Set before subscribing: the backend may tick as soon as the subscription exists.
+        subscribedPeriodNanos = service.refreshPeriodNanos(displayId)
+        nextPeriodCheckNanos = System.nanoTime() + periodCheckIntervalNanos
+        tickTimeoutMillis = tickTimeoutMillisFor(subscribedPeriodNanos)
         receivedTick = false
-        // A backend that throws instead of returning null — a missing native entry point raises UnsatisfiedLinkError
-        // here — has to degrade to unpaced repaints like any other refusal. An exception escaping the frame loop would
-        // cancel it, and the layer would then stop repainting altogether.
-        val newSubscription = try {
-            service.subscribe(displayId) { _, _ -> onTick() }
-        } catch (_: Throwable) {
-            null
-        }
+
+        val generation = ++subscriptionGeneration
+        val newSubscription = service.subscribe(displayId) { _, _ -> tickChannel.trySend(generation) }
         if (newSubscription == null) {
             failedDisplayId = displayId
-            return
+            return false
         }
 
         subscription = newSubscription
         subscribedDisplayId = displayId
         failedDisplayId = UNKNOWN_DISPLAY_ID
+        return true
     }
 
     /**
-     * Called by the FramePacing service on a non-EDT thread; must return immediately.
+     * Whether the subscribed display now runs at another refresh rate. A clock is built for one rate — the timer's
+     * cadence, the guard against a source that spins — so a new subscription is needed to follow the mode. Asking
+     * the toolkit for the display mode can cost a round trip to the display server, hence not on every frame.
      */
-    private fun onTick() {
-        receivedTick = true
-        // A resume racing with cancellation (tick timeout, dispose) is benign: resuming a canceled continuation
-        // is ignored.
-        tickContinuation.getAndSet(null)?.resume(Unit)
+    private fun refreshRateChanged(service: FramePacingService): Boolean {
+        val now = System.nanoTime()
+        if (now - nextPeriodCheckNanos < 0) return false
+
+        nextPeriodCheckNanos = now + periodCheckIntervalNanos
+        return service.refreshPeriodNanos(subscribedDisplayId) != subscribedPeriodNanos
     }
 
     private fun resolveDisplayId(service: FramePacingService): Long {
@@ -241,33 +195,34 @@ internal class SwingRepaintPacer(
         private const val UNKNOWN_DISPLAY_ID = -1L
         private const val TICK_TIMEOUT_PERIODS = 3
 
-        /**
-         * Tick timeout when the refresh period is unknown: 3 periods at 60 Hz.
-         */
+        /** Tick timeout when the refresh period is unknown: three periods at 60 Hz. */
         private const val DEFAULT_TICK_TIMEOUT_MILLIS = 50L
 
         /**
-         * Absolute floor for the tick timeout. On a VRR display the refresh period reported by the
-         * service is the nominal maximum-rate one, but adaptive refresh legitimately produces
-         * single tick gaps several times that long (measured: up to 23.8 ms against a 5.56 ms
-         * nominal period on a 180 Hz adaptive panel), so a purely period-derived timeout would
-         * misfire on healthy clocks. 50 ms keeps the timeout meaningful at any refresh rate while
-         * staying comfortably above every observed adaptive gap.
+         * Floor for the tick timeout. A variable-refresh display reports its maximum rate, but its actual tick gaps
+         * can be several times longer (measured: up to 23.8 ms against a 5.56 ms nominal period on a 180 Hz panel),
+         * so a timeout derived from the period alone would fire on a healthy clock.
          */
         private const val MIN_TICK_TIMEOUT_MILLIS = 50L
 
         /**
-         * How long a component may stop requesting frames before the pacer gives its clock back. Long enough that a
-         * component invalidating in bursts keeps one subscription across the whole burst, short enough that an idle
-         * window is not holding a running display clock.
+         * Budget for a fresh subscription's first tick. It has to cover the clock thread starting and the native
+         * source opening — a DXGI enumeration on Windows — or a healthy clock that takes longer than the per-period
+         * timeout to start would be remembered as unpaceable.
          */
+        private const val FIRST_TICK_TIMEOUT_MILLIS = 500L
+
+        /** How often a subscription's refresh rate is compared with the display's current one. */
+        private const val PERIOD_CHECK_INTERVAL_NANOS = 1_000_000_000L
+
+        /** How long a component may stop requesting frames before its subscription is released. */
         private const val IDLE_RELEASE_DELAY_MILLIS = 1_000
     }
 }
 
 /**
- * The tick source [SwingRepaintPacer] needs. Kept as an interface so tests can drive the pacer with a controllable
- * clock; production code uses [SkikoFramePacingService].
+ * The tick source [SwingRepaintPacer] needs. An interface so tests can drive the pacer with a controllable clock;
+ * production code uses [SkikoFramePacingService].
  */
 internal interface FramePacingService {
     /**
@@ -283,16 +238,13 @@ internal interface FramePacingService {
     /**
      * Subscribes [onTick] to refresh ticks of [displayId]. [onTick] is invoked on an arbitrary non-EDT thread. Returns
      * a handle that closes the subscription, or null if the display cannot be paced.
+     *
+     * If [onTick] throws, the exception is printed and that listener is removed, so a broken listener cannot keep
+     * throwing on later ticks. Other listeners on the same display are unaffected. Closing the returned handle is still
+     * valid after a drop.
      */
     fun subscribe(
         displayId: Long,
         onTick: (displayId: Long, timeNanos: Long) -> Unit
     ): AutoCloseable?
-}
-
-/**
- * Resolves the [FramePacingService] the pacer uses: Skiko's own display clocks, so pacing works on any runtime.
- */
-internal object FramePacingServices {
-    val default: FramePacingService? by lazy { SkikoFramePacingService.instance }
 }

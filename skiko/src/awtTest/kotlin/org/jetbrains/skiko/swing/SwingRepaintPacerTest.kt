@@ -50,7 +50,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun passesThroughDirectlyWhenServiceIsAbsent() {
+    fun `passes through directly when the service is absent`() {
         onEdt {
             pacer = SwingRepaintPacer(panel, service = null)
             attachAndPack()
@@ -63,7 +63,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun paintsUnpacedWhileComponentHasNoDisplay() {
+    fun `paints unpaced while the component has no display`() {
         val service = FakeFramePacingService()
         val before = onEdtGet {
             pacer = SwingRepaintPacer(panel, service)
@@ -78,7 +78,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun paintsFirstFrameImmediatelyAndSubscribesOnce() {
+    fun `paints the first frame immediately and subscribes once`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -99,7 +99,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun pacesContinuousRequestsToOneRepaintPerTick() {
+    fun `paces continuous requests to one repaint per tick`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -131,7 +131,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun paintsUnpacedWhenDisplayCannotBePaced() {
+    fun `paints unpaced when the display cannot be paced`() {
         val service = FakeFramePacingService().apply { refuseSubscriptions = true }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -151,13 +151,10 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun tickTimeoutAfterAClockStallsResubscribesOnTheNextFrame() {
-        // The clock ticks once on subscribe and then goes silent, so the wait times out with the
-        // subscription having proven itself alive. The tick timeout floors at 50 ms.
-        val service = FakeFramePacingService().apply {
-            periodNanos = 5_000_000L
-            tickOnSubscribe = true
-        }
+    fun `a tick timeout after a clock stalls resubscribes on the next frame`() {
+        // A 100 ms period puts the tick timeout at 300 ms: long enough to deliver the first tick
+        // with room to spare, short enough for the stall to time out within the test.
+        val service = FakeFramePacingService().apply { periodNanos = 100_000_000L }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
             attachAndPack()
@@ -167,21 +164,27 @@ class SwingRepaintPacerTest {
         onEdt { pacer?.requestRepaint() }
         waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 1 }
         assertEquals(1, service.subscribeCount)
+        // The EDT being free means the loop is suspended in its wait, so this tick is received,
+        // and the subscription has proven itself alive.
+        onEdt {}
+        service.tick()
 
-        // The stalled clock's wait times out and drops the subscription...
+        // The clock then stalls: the next frame's wait times out and drops the subscription...
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 2 }
         waitUntil { onEdtGet { service.closeCount } == 1 }
         // ...without issuing any repaint — the frame was already painted before the wait.
         settle()
-        assertEquals(baseline + 1, onEdtGet { panel.repaintCount.get() })
+        assertEquals(baseline + 2, onEdtGet { panel.repaintCount.get() })
 
         // A stall is treated as transient, so the next frame re-creates the subscription.
         onEdt { pacer?.requestRepaint() }
-        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 2 }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 3 }
         waitUntil { onEdtGet { service.subscribeCount } == 2 }
     }
 
     @Test
-    fun doesNotResubscribeToAClockThatNeverTicked() {
+    fun `does not resubscribe to a clock that never ticked`() {
         // A backend that accepts the display and then stays silent — a native clock that failed to
         // open its display source looks exactly like this. Re-subscribing on every timeout would
         // rebuild that clock forever and hold the scene to one repaint per timeout.
@@ -209,29 +212,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun aThrowingBackendDegradesToUnpacedInsteadOfKillingTheFrameLoop() {
-        // A missing native entry point raises UnsatisfiedLinkError from subscribe. If that escaped
-        // the frame loop it would cancel it, and the layer would stop repainting for good.
-        val service = FakeFramePacingService().apply { subscribeThrows = true }
-        onEdt {
-            pacer = SwingRepaintPacer(panel, service)
-            attachAndPack()
-        }
-        val baseline = onEdtGet { panel.repaintCount.get() }
-
-        onEdt { pacer?.requestRepaint() }
-        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 1 }
-
-        // The frame loop is still alive, and the refused display is not retried.
-        onEdt { pacer?.requestRepaint() }
-        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 2 }
-        settle()
-        assertEquals(1, service.subscribeAttempts)
-        assertEquals(0, service.subscribeCount)
-    }
-
-    @Test
-    fun resubscribesWhenTheDisplayChanges() {
+    fun `resubscribes when the display changes`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -260,7 +241,67 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun closesSubscriptionWhenTheDisplayBecomesUnresolvable() {
+    fun `resubscribes when the refresh rate changes`() {
+        // A clock is built for one refresh rate, so a mode change on the same display needs a new one.
+        val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
+        onEdt {
+            pacer = SwingRepaintPacer(panel, service, periodCheckIntervalNanos = 0)
+            attachAndPack()
+        }
+        val baseline = onEdtGet { panel.repaintCount.get() }
+
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 1 }
+        service.tick() // end the wait; the loop goes idle
+
+        // Same display, same rate: no subscription churn.
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 2 }
+        assertEquals(1, service.subscribeCount)
+        service.tick()
+
+        service.periodNanos = HUGE_PERIOD_NANOS / 2
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 3 }
+        assertEquals(listOf(DISPLAY_A, DISPLAY_A), service.subscribedDisplayIds)
+        assertEquals(1, service.closeCount)
+    }
+
+    @Test
+    fun `a tick from a closed subscription does not end the new wait`() {
+        // A clock delivers from a snapshot of its listeners, so a subscription can receive one tick
+        // after it was closed. That tick must not release a wait on the subscription that replaced it.
+        val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
+        onEdt {
+            pacer = SwingRepaintPacer(panel, service)
+            attachAndPack()
+        }
+        val baseline = onEdtGet { panel.repaintCount.get() }
+
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 1 }
+        service.tick() // the first subscription proves alive; the loop goes idle
+
+        // Moving to another display replaces the subscription; a request then leaves the loop
+        // waiting on the new one.
+        service.displayIdToReturn = DISPLAY_B
+        onEdt { pacer?.requestRepaint() }
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 2 }
+        assertEquals(1, service.closeCount)
+        onEdt { pacer?.requestRepaint() }
+
+        // A late tick from the closed subscription: nothing may be released.
+        service.tickPrevious()
+        settle()
+        assertEquals(baseline + 2, onEdtGet { panel.repaintCount.get() })
+
+        // A tick from the live subscription releases the pending frame.
+        service.tick()
+        waitUntil { onEdtGet { panel.repaintCount.get() } == baseline + 3 }
+    }
+
+    @Test
+    fun `closes the subscription when the display becomes unresolvable`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -282,7 +323,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun closesSubscriptionOnDisposeAndPassesThroughAfterwards() {
+    fun `closes the subscription on dispose and passes through afterwards`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -309,7 +350,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun releasesTheSubscriptionOnceTheComponentGoesIdle() {
+    fun `releases the subscription once the component goes idle`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -333,7 +374,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun keepsTheSubscriptionWhileTheFrameLoopIsWaiting() {
+    fun `keeps the subscription while the frame loop is waiting`() {
         val service = FakeFramePacingService().apply { periodNanos = HUGE_PERIOD_NANOS }
         onEdt {
             pacer = SwingRepaintPacer(panel, service)
@@ -356,7 +397,7 @@ class SwingRepaintPacerTest {
     }
 
     @Test
-    fun framePacingPropertyDefaultsToFalse() {
+    fun `the frame pacing property defaults to false`() {
         assertFalse(SkikoProperties.swingFramePacingEnabled)
     }
 
@@ -406,10 +447,6 @@ class SwingRepaintPacerTest {
         var displayIdToReturn = DISPLAY_A
         var periodNanos = 1_000_000_000L
         var refuseSubscriptions = false
-        var subscribeThrows = false
-
-        /** Delivers one tick from the subscribe call itself, modelling a clock that ticks and then stalls. */
-        var tickOnSubscribe = false
 
         @Volatile
         var subscribeAttempts = 0
@@ -424,6 +461,9 @@ class SwingRepaintPacerTest {
 
         private var listener: ((Long, Long) -> Unit)? = null
 
+        /** The listener of the subscription before the current one, kept to model a late delivery. */
+        private var previousListener: ((Long, Long) -> Unit)? = null
+
         override fun displayId(graphicsConfiguration: GraphicsConfiguration): Long =
             displayIdToReturn
 
@@ -434,20 +474,14 @@ class SwingRepaintPacerTest {
             onTick: (displayId: Long, timeNanos: Long) -> Unit
         ): AutoCloseable? {
             subscribeAttempts++
-            if (subscribeThrows) throw UnsatisfiedLinkError("no native clock")
             if (refuseSubscriptions) return null
             subscribedDisplayIds += displayId
             listener = onTick
             subscribeCount++
-            if (tickOnSubscribe) {
-                // On the tick source's own thread, like the real one, and joined so the test never
-                // races the delivery.
-                val delivery = Thread { onTick(displayId, System.nanoTime()) }
-                delivery.start()
-                delivery.join()
-            }
             return AutoCloseable {
                 if (listener === onTick) {
+                    // The clock's delivery snapshot can still call this listener once after close.
+                    previousListener = onTick
                     listener = null
                 }
                 closeCount++
@@ -458,6 +492,12 @@ class SwingRepaintPacerTest {
         fun tick() {
             check(!SwingUtilities.isEventDispatchThread())
             listener?.invoke(displayIdToReturn, System.nanoTime())
+        }
+
+        /** A tick that a closed subscription delivers late, from its clock's listener snapshot. */
+        fun tickPrevious() {
+            check(!SwingUtilities.isEventDispatchThread())
+            previousListener?.invoke(displayIdToReturn, System.nanoTime())
         }
     }
 
