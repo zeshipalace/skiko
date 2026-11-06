@@ -10,6 +10,7 @@ name: Voxzen Publish
 # - publish-linux-arm64:ARM runner + docker linux-compat,只发 linux-arm64 runtime
 #   (上游注明 x64 交叉编译 arm64 不可用)
 # - publish-windows / publish-macos:各发自己平台的 x64 + arm64 runtime
+# - publish-macos 还构建、验证并发布 iOS 真机与 ARM64 模拟器 KLIB
 #
 # 非 linux 作业只发布平台独有的 runtime 产物:公共产物由 publish-linux 发布,
 # GitHub Packages 拒收重复版本,重复推送会导致作业失败。
@@ -35,7 +36,34 @@ permissions:
   packages: write
 
 jobs:
+  verify-ios:
+    if: inputs.scope == 'all' || inputs.scope == 'portable'
+    name: 'Build and verify iOS KLIBs'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        name: 'Select latest installed Xcode'
+        run: python3 .github/scripts/select-latest-xcode.py | tee -a "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+      - uses: ./.github/actions/setup-prerequisites
+      - shell: bash
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.native.ios.arm64.enabled=true \
+            -Pskiko.native.ios.simulatorArm64.enabled=true \
+            publishIosArm64PublicationToBuildRepoRepository \
+            publishIosSimulatorArm64PublicationToBuildRepoRepository
+          version=$(sed -n 's/^deploy.version=//p' skiko/gradle.properties)
+          [[ "$version" =~ ^[0-9]+([.][0-9]+)*-voxzen[.][0-9]+$ ]]
+          python3 .github/scripts/verify-ios-klibs.py skiko/build/repo "$version"
   publish-linux:
+    needs: verify-ios
     if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish (Linux x64 + shared artifacts)'
     runs-on: ubuntu-24.04
@@ -65,9 +93,12 @@ jobs:
               -Pskiko.native.enabled=true \
               -Pskiko.awt.enabled=true \
               -Pskiko.arch=x64 \
-              publishToVoxzenGitHubPackages
+              publishToVoxzenGitHubPackages \
+              -x publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
+              -x publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-linux-arm64:
+    needs: verify-ios
     if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish Linux arm64 runtime'
     runs-on: ubuntu-24.04-arm
@@ -97,7 +128,8 @@ jobs:
               publishSkikoJvmRuntimeLinuxArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-windows:
-    if: inputs.scope != 'portable'
+    needs: verify-ios
+    if: ${{ always() && (inputs.scope == 'windows' || inputs.scope == 'windows-dry-run' || (inputs.scope == 'all' && needs.verify-ios.result == 'success')) }}
     name: 'Publish Windows runtimes'
     runs-on: windows-2022
     steps:
@@ -164,12 +196,17 @@ jobs:
             publishSkikoJvmRuntimeWindowsArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-macos:
+    needs: verify-ios
     if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish macOS runtimes'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         name: 'Check out code'
+
+      - shell: bash
+        name: 'Select latest installed Xcode'
+        run: python3 .github/scripts/select-latest-xcode.py | tee -a "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         name: 'Setup JDK 21'
@@ -179,6 +216,34 @@ jobs:
 
       - uses: ./.github/actions/setup-prerequisites
         name: 'Setup Prerequisites'
+
+      # 发布作业会独立重建,因此也要核验此 runner 上实际将要发布的 KLIB
+      - shell: bash
+        name: 'Build and verify iOS KLIBs for publication'
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.native.ios.arm64.enabled=true \
+            -Pskiko.native.ios.simulatorArm64.enabled=true \
+            publishIosArm64PublicationToBuildRepoRepository \
+            publishIosSimulatorArm64PublicationToBuildRepoRepository
+          version=$(sed -n 's/^deploy.version=//p' skiko/gradle.properties)
+          python3 .github/scripts/verify-ios-klibs.py skiko/build/repo "$version"
+
+      - shell: bash
+        name: 'Publish iOS KLIBs to GitHub Packages'
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew -p skiko --no-daemon --stacktrace \
+            -Pdeploy.release=true \
+            -Pskiko.awt.enabled=true \
+            -Pskiko.native.ios.arm64.enabled=true \
+            -Pskiko.native.ios.simulatorArm64.enabled=true \
+            publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
+            publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
 
       - shell: bash
         name: 'Publish macOS arm64 runtime to GitHub Packages'

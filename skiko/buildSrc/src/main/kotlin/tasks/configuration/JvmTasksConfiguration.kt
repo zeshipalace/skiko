@@ -515,7 +515,8 @@ fun SkikoProjectContext.createLinkJvmBindings(
                 "-shared",
                 "-dead_strip",
                 "-install_name", "./${libOutputFileName.get()}",
-                "-current_version", skiko.baseDeployVersion,
+                // Mach-O requires a numeric version even when the Maven version has a suffix.
+                "-current_version", skiko.baseDeployVersion.substringBefore("-"),
                 *resolvedBinaryInputs.linkFlags.toTypedArray(),
                 *resolvedBinaryInputs.frameworks.toTypedArray(),
                 *if (resolvedCoreLinkedLibraryDirs != null) arrayOf(

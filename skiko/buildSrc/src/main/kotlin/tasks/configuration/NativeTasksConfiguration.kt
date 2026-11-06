@@ -53,18 +53,12 @@ fun KotlinTarget.isUikitSimulator() =
     name.contains("Simulator", ignoreCase = true) || name == "tvosX64" // x64 tvOS is implicitly a simulator
 
 fun Project.findXcodeSdkRoot(): String {
-    val defaultPath = "/Applications/Xcode.app/Contents/Developer/Platforms"
-    if (File(defaultPath).exists()) {
-        return defaultPath.also {
-            println("findXcodeSdkRoot = $it")
-        }
-    }
-
-    return (project.property("skiko.ci.xcodehome") as? String)?.let {
-        val sdkPath = it + "/Platforms"
-        println("findXcodeSdkRoot = $sdkPath")
-        sdkPath
-    } ?: error("gradle property `skiko.ci.xcodehome` is not set")
+    val developerDir = (findProperty("skiko.ci.xcodehome") as? String)
+        ?: System.getenv("DEVELOPER_DIR")
+        ?: "/Applications/Xcode.app/Contents/Developer"
+    val sdkPath = File(developerDir, "Platforms")
+    check(sdkPath.isDirectory) { "Xcode Platforms directory not found: $sdkPath" }
+    return sdkPath.absolutePath.also { println("findXcodeSdkRoot = $it") }
 }
 
 private fun SkikoProjectContext.configureNativeSymbolSourcesElements(
