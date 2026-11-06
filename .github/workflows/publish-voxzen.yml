@@ -30,12 +30,31 @@ on:
           - windows-dry-run
           - windows
           - portable
+          - macos-probe
 
 permissions:
   contents: read
   packages: write
 
 jobs:
+  probe-macos:
+    if: inputs.scope == 'macos-probe'
+    name: 'Probe macOS 26 ARM64 runner'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        name: 'Select latest installed Xcode'
+        run: python3 .github/scripts/select-latest-xcode.py | tee -a "$GITHUB_ENV"
+      - shell: bash
+        name: 'Check macOS and Xcode'
+        run: |
+          test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
+
   verify-ios:
     if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Build and verify iOS KLIBs'
