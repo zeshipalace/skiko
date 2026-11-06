@@ -31,6 +31,7 @@ on:
           - windows
           - portable
           - macos-probe
+          - macos-recovery
 
 permissions:
   contents: read
@@ -216,9 +217,10 @@ jobs:
 
   publish-macos:
     needs: verify-ios
-    if: inputs.scope == 'all' || inputs.scope == 'portable'
+    # 恢复模式仅在核实 iOS 与 macOS 发布物全部缺失后使用，依赖本作业的同 runner 构建验证
+    if: ${{ !cancelled() && (inputs.scope == 'macos-recovery' || ((inputs.scope == 'all' || inputs.scope == 'portable') && needs.verify-ios.result == 'success')) }}
     name: 'Publish macOS runtimes'
-    runs-on: macos-15
+    runs-on: ${{ inputs.scope == 'macos-recovery' && 'macos-26' || 'macos-15' }}
     steps:
       - uses: actions/checkout@v4
         name: 'Check out code'
