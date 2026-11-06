@@ -86,7 +86,7 @@ Voxzen Windows 配置使用 `8M`,其它调用方仍保持默认 `0`。独立预�
    - `publish-linux`:docker `linux-compat` 镜像内发布全部公共产物(skiko、skiko-awt、skiko-awt-runtime 等)+ linux-x64 runtime(旧 glibc 基线,可对外分发)
    - `publish-linux-arm64`:`ubuntu-24.04-arm` runner + `linux-compat` 镜像(**ARM runner 只对公开仓库免费**)
    - `publish-windows`:windows-2022,x64 本机编译 + arm64 MSVC 交叉编译
-   - `publish-macos`:macos-15(桌面 arm64 本机 + x64 工具链交叉编译,以及 iOS ARM64 真机和模拟器 KLIB)
+   - `publish-macos`:macos-26(桌面 arm64 本机 + x64 工具链交叉编译,以及 iOS ARM64 真机和模拟器 KLIB)
    - Linux 作业发布公共元数据时跳过两个 iOS publication,由 macOS 作业发布完整的 iOS 原生库,避免同版本重复推送
    - 发布任务并行执行,GitHub Packages 不支持跨模块原子发布;发布失败后须核对各模块状态,不得覆盖已有版本
    - 首次运行会先在 CI 本地构建 docker 镜像(ghcr 无 `linux-compat:voxzen` tag 时自动 build,较耗时);可提前跑 `Docker Publish` workflow 预热镜像

@@ -30,36 +30,16 @@ on:
           - windows-dry-run
           - windows
           - portable
-          - macos-probe
-          - macos-recovery
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  probe-macos:
-    if: inputs.scope == 'macos-probe'
-    name: 'Probe macOS 26 ARM64 runner'
-    runs-on: macos-26
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - shell: bash
-        name: 'Select latest installed Xcode'
-        run: python3 .github/scripts/select-latest-xcode.py | tee -a "$GITHUB_ENV"
-      - shell: bash
-        name: 'Check macOS and Xcode'
-        run: |
-          test "$(uname -m)" = arm64
-          sw_vers
-          xcodebuild -version
-
   verify-ios:
     if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Build and verify iOS KLIBs'
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - shell: bash
@@ -77,8 +57,8 @@ jobs:
             -Pskiko.awt.enabled=true \
             -Pskiko.native.ios.arm64.enabled=true \
             -Pskiko.native.ios.simulatorArm64.enabled=true \
-            publishIosArm64PublicationToBuildRepoRepository \
-            publishIosSimulatorArm64PublicationToBuildRepoRepository
+            :publishIosArm64PublicationToBuildRepoRepository \
+            :publishIosSimulatorArm64PublicationToBuildRepoRepository
           version=$(sed -n 's/^deploy.version=//p' skiko/gradle.properties)
           [[ "$version" =~ ^[0-9]+([.][0-9]+)*-voxzen[.][0-9]+$ ]]
           python3 .github/scripts/verify-ios-klibs.py skiko/build/repo "$version"
@@ -114,8 +94,8 @@ jobs:
               -Pskiko.awt.enabled=true \
               -Pskiko.arch=x64 \
               publishToVoxzenGitHubPackages \
-              -x publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
-              -x publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
+              -x :publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
+              -x :publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
 
   publish-linux-arm64:
     needs: verify-ios
@@ -217,10 +197,9 @@ jobs:
 
   publish-macos:
     needs: verify-ios
-    # 恢复模式仅在核实 iOS 与 macOS 发布物全部缺失后使用，依赖本作业的同 runner 构建验证
-    if: ${{ !cancelled() && (inputs.scope == 'macos-recovery' || ((inputs.scope == 'all' || inputs.scope == 'portable') && needs.verify-ios.result == 'success')) }}
+    if: inputs.scope == 'all' || inputs.scope == 'portable'
     name: 'Publish macOS runtimes'
-    runs-on: ${{ inputs.scope == 'macos-recovery' && 'macos-26' || 'macos-15' }}
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
         name: 'Check out code'
@@ -247,8 +226,8 @@ jobs:
             -Pskiko.awt.enabled=true \
             -Pskiko.native.ios.arm64.enabled=true \
             -Pskiko.native.ios.simulatorArm64.enabled=true \
-            publishIosArm64PublicationToBuildRepoRepository \
-            publishIosSimulatorArm64PublicationToBuildRepoRepository
+            :publishIosArm64PublicationToBuildRepoRepository \
+            :publishIosSimulatorArm64PublicationToBuildRepoRepository
           version=$(sed -n 's/^deploy.version=//p' skiko/gradle.properties)
           python3 .github/scripts/verify-ios-klibs.py skiko/build/repo "$version"
 
@@ -263,8 +242,8 @@ jobs:
             -Pskiko.awt.enabled=true \
             -Pskiko.native.ios.arm64.enabled=true \
             -Pskiko.native.ios.simulatorArm64.enabled=true \
-            publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
-            publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
+            :publishIosArm64PublicationToVoxzenGitHubPackagesRepository \
+            :publishIosSimulatorArm64PublicationToVoxzenGitHubPackagesRepository
 
       - shell: bash
         name: 'Publish macOS arm64 runtime to GitHub Packages'

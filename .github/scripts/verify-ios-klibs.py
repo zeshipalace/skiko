@@ -39,6 +39,5 @@ if __name__ == '__main__':
     if len(sys.argv) != 3 or not sys.argv[2] or '/' in sys.argv[2]:
         raise SystemExit('usage: verify-ios-klibs.py MAVEN_REPOSITORY VERSION')
     repository = Path(sys.argv[1])
-    for module in ('skiko', 'skiko-graphite', 'skiko-skottie'):
-        verify(repository, sys.argv[2], module, 'iosarm64', 'ios_arm64', 'ios')
-        verify(repository, sys.argv[2], module, 'iossimulatorarm64', 'ios_simulator_arm64', 'iosSim')
+    verify(repository, sys.argv[2], 'skiko', 'iosarm64', 'ios_arm64', 'ios')
+    verify(repository, sys.argv[2], 'skiko', 'iossimulatorarm64', 'ios_simulator_arm64', 'iosSim')
